@@ -8,8 +8,8 @@ from dotenv import load_dotenv
 import asyncio
 from base64 import b64decode
 import httpx
-# --- NOVA IMPORTAÇÃO PARA DNS-OVER-HTTPS ---
-from httpx_dns import AsyncDNSoverHTTPS
+# --- IMPORTAÇÃO CORRETA PARA DNS-OVER-HTTPS ---
+from doh_httpx import DOHClient
 
 # --- Libs da Solana ---
 from solders.pubkey import Pubkey
@@ -328,8 +328,7 @@ async def set_params(update, context):
         
         logger.info(f"A validar o endereço do contrato: {pair_address}")
         # --- ALTERAÇÃO: USA O NOVO TRANSPORTE DoH PARA VERIFICAÇÃO ---
-        transport = DOHTransport()
-        async with httpx.AsyncClient(transport=transport, timeout=10.0) as temp_client:
+        async with DOHClient(timeout=10.0) as temp_client:
             pair_details = await get_pair_details(pair_address, client=temp_client)
 
         if not pair_details:
@@ -369,8 +368,7 @@ async def run_bot(update, context):
     
     # --- ALTERAÇÃO: INICIA O CLIENTE HTTP COM O TRANSPORTE DoH ---
     logger.info("Iniciando o cliente de rede principal (httpx) com resolvedor DNS-over-HTTPS...")
-    transport = DOHTransport()
-    http_client = httpx.AsyncClient(transport=transport, timeout=30.0)
+    http_client = DOHClient(timeout=30.0)
     
     bot_running = True
     logger.info("Bot alterado para o estado 'em execução'.")
