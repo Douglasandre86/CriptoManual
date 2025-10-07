@@ -86,56 +86,67 @@ async def execute_swap(input_mint_str, output_mint_str, amount, input_decimals, 
     logger.info(f"De: {amount} {input_mint_str} | Para: {output_mint_str}")
     amount_wei = int(amount * (10**input_decimals))
     
-    try:
-        # ETAPA 1: Obter cotação
-        logger.info(f"[SWAP 1/5] Obtendo cotação da API da Jupiter...")
-        quote_url = f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint_str}&outputMint={output_mint_str}&amount={amount_wei}&slippageBps={slippage_bps}"
-        quote_res = await http_client.get(quote_url)
-        quote_res.raise_for_status()
-        quote_response = quote_res.json()
-        logger.info("[SWAP 1/5] Cotação recebida com sucesso.")
+    for attempt in range(3):
+        try:
+            # ETAPA 1: Obter cotação
+            logger.info(f"[SWAP 1/5] Obtendo cotação da API da Jupiter (tentativa {attempt + 1}/3)...")
+            quote_url = f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint_str}&outputMint={output_mint_str}&amount={amount_wei}&slippageBps={slippage_bps}"
+            quote_res = await http_client.get(quote_url)
+            quote_res.raise_for_status()
+            quote_response = quote_res.json()
+            logger.info("[SWAP 1/5] Cotação recebida com sucesso.")
 
-        # ETAPA 2: Obter transação
-        logger.info("[SWAP 2/5] Solicitando a transação de swap...")
-        swap_payload = {
-            "userPublicKey": str(payer.pubkey()),
-            "quoteResponse": quote_response,
-            "wrapAndUnwrapSol": True,
-            "prioritizationFee": parameters["priority_fee"]
-        }
-        swap_url = "https://quote-api.jup.ag/v6/swap"
-        swap_res = await http_client.post(swap_url, json=swap_payload)
-        swap_res.raise_for_status()
-        swap_response = swap_res.json()
-        swap_tx_b64 = swap_response.get('swapTransaction')
-        if not swap_tx_b64:
-            logger.error(f"[ERRO SWAP] A API da Jupiter não retornou uma transação. Resposta: {swap_response}"); return None
-        logger.info("[SWAP 2/5] Transação recebida com sucesso.")
-        
-        # ETAPA 3: Assinar a transação
-        logger.info("[SWAP 3/5] Decodificando e assinando a transação com a chave privada...")
-        raw_tx_bytes = b64decode(swap_tx_b64)
-        swap_tx = VersionedTransaction.from_bytes(raw_tx_bytes)
-        signature = payer.sign_message(to_bytes_versioned(swap_tx.message))
-        signed_tx = VersionedTransaction.populate(swap_tx.message, [signature])
-        logger.info("[SWAP 3/5] Transação assinada com sucesso.")
+            # ETAPA 2: Obter transação
+            logger.info(f"[SWAP 2/5] Solicitando a transação de swap (tentativa {attempt + 1}/3)...")
+            swap_payload = {
+                "userPublicKey": str(payer.pubkey()),
+                "quoteResponse": quote_response,
+                "wrapAndUnwrapSol": True,
+                "prioritizationFee": parameters["priority_fee"]
+            }
+            swap_url = "https://quote-api.jup.ag/v6/swap"
+            swap_res = await http_client.post(swap_url, json=swap_payload)
+            swap_res.raise_for_status()
+            swap_response = swap_res.json()
+            swap_tx_b64 = swap_response.get('swapTransaction')
+            if not swap_tx_b64:
+                logger.error(f"[ERRO SWAP] A API da Jupiter não retornou uma transação. Resposta: {swap_response}"); return None
+            logger.info("[SWAP 2/5] Transação recebida com sucesso.")
+            
+            # ETAPA 3: Assinar a transação
+            logger.info("[SWAP 3/5] Decodificando e assinando a transação com a chave privada...")
+            raw_tx_bytes = b64decode(swap_tx_b64)
+            swap_tx = VersionedTransaction.from_bytes(raw_tx_bytes)
+            signature = payer.sign_message(to_bytes_versioned(swap_tx.message))
+            signed_tx = VersionedTransaction.populate(swap_tx.message, [signature])
+            logger.info("[SWAP 3/5] Transação assinada com sucesso.")
 
-        # ETAPA 4: Enviar para a blockchain
-        logger.info("[SWAP 4/5] Enviando a transação para a rede Solana...")
-        tx_opts = TxOpts(skip_preflight=False, preflight_commitment="confirmed")
-        tx_signature = solana_client.send_raw_transaction(bytes(signed_tx), opts=tx_opts).value
-        logger.info(f"[SWAP 4/5] Transação enviada. Assinatura: {tx_signature}")
-        
-        # ETAPA 5: Confirmar a transação
-        logger.info(f"[SWAP 5/5] Aguardando confirmação final da transação na blockchain...")
-        solana_client.confirm_transaction(tx_signature, commitment="confirmed")
-        logger.info(f"[SWAP 5/5] SUCESSO! Transação confirmada: https://solscan.io/tx/{tx_signature}")
-        
-        return str(tx_signature)
+            # ETAPA 4: Enviar para a blockchain
+            logger.info("[SWAP 4/5] Enviando a transação para a rede Solana...")
+            tx_opts = TxOpts(skip_preflight=False, preflight_commitment="confirmed")
+            tx_signature = solana_client.send_raw_transaction(bytes(signed_tx), opts=tx_opts).value
+            logger.info(f"[SWAP 4/5] Transação enviada. Assinatura: {tx_signature}")
+            
+            # ETAPA 5: Confirmar a transação
+            logger.info(f"[SWAP 5/5] Aguardando confirmação final da transação na blockchain...")
+            solana_client.confirm_transaction(tx_signature, commitment="confirmed")
+            logger.info(f"[SWAP 5/5] SUCESSO! Transação confirmada: https://solscan.io/tx/{tx_signature}")
+            
+            return str(tx_signature)
 
-    except Exception as e:
-        logger.error(f"[ERRO SWAP] Falha crítica durante o processo de swap: {e}", exc_info=True)
-        await send_telegram_message(f"⚠️ Falha na transação: {e}"); return None
+        except httpx.ConnectError as e:
+            logger.error(f"[ERRO DE CONEXÃO SWAP] Falha ao conectar à Jupiter (tentativa {attempt + 1}/3): {e}")
+            if attempt < 2:
+                await asyncio.sleep(2) # Espera 2 segundos antes de tentar novamente
+                continue
+            else:
+                logger.critical("[ERRO SWAP] Falha crítica após 3 tentativas de conexão com a Jupiter.")
+                await send_telegram_message(f"⚠️ Falha de rede persistente ao contatar a Jupiter: {e}"); return None
+        except Exception as e:
+            logger.error(f"[ERRO SWAP] Falha crítica inesperada durante o processo de swap: {e}", exc_info=True)
+            await send_telegram_message(f"⚠️ Falha na transação: {e}"); return None
+    
+    return None # Retorna None se todas as tentativas falharem
 
 async def execute_buy_order(amount, price, reason="Compra Manual"):
     global in_position, entry_price, monitor_task
