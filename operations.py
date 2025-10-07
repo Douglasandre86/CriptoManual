@@ -8,8 +8,6 @@ from dotenv import load_dotenv
 import asyncio
 from base64 import b64decode
 import httpx
-# --- IMPORTAÇÃO CORRETA PARA DNS-OVER-HTTPS ---
-from doh_httpx import DOHClient
 
 # --- Libs da Solana ---
 from solders.pubkey import Pubkey
@@ -29,7 +27,6 @@ app = Flask('')
 def home():
     return "Bot is alive!"
 def run_server():
-  # Adiciona log para saber que o servidor web iniciou
   logger.info("Iniciando servidor Flask para manter o bot ativo.")
   app.run(host='0.0.0.0',port=8080)
 def keep_alive():
@@ -45,12 +42,11 @@ CHAT_ID = os.getenv("CHAT_ID")
 PRIVATE_KEY_B58 = os.getenv("PRIVATE_KEY_BASE58")
 RPC_URL = os.getenv("RPC_URL")
 
-# Configuração do logging para ser mais detalhado
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', handlers=[logging.StreamHandler()])
 logger = logging.getLogger(__name__)
 
 if not all([TELEGRAM_TOKEN, CHAT_ID, PRIVATE_KEY_B58, RPC_URL]):
-    logger.critical("ERRO FATAL: Uma ou mais variáveis de ambiente não estão definidas. Verifique o seu ficheiro .env ou as configurações do Railway.")
+    logger.critical("ERRO FATAL: Uma ou mais variáveis de ambiente não estão definidas.")
     exit()
 
 # --- CLIENTES PERSISTENTES ---
@@ -72,6 +68,7 @@ in_position = False
 entry_price = 0.0
 monitor_task = None
 application = None
+jupiter_api_ip = None # Variável para armazenar o IP da Jupiter
 
 parameters = {
     "pair_address": None,
@@ -81,74 +78,97 @@ parameters = {
     "priority_fee": 2000000
 }
 
+# --- FUNÇÃO DE RESOLUÇÃO DE DNS MANUAL ---
+async def resolve_ip_with_doh(hostname):
+    """Resolve o IP de um hostname usando a API DNS-over-HTTPS da Cloudflare."""
+    logger.info(f"Resolvendo o IP para {hostname} usando DNS-over-HTTPS...")
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                "https://cloudflare-dns.com/dns-query",
+                headers={"accept": "application/dns-json"},
+                params={"name": hostname, "type": "A"},
+            )
+            response.raise_for_status()
+            data = response.json()
+            if data.get("Status") == 0 and "Answer" in data:
+                ip_address = data["Answer"][0]["data"]
+                logger.info(f"IP para {hostname} resolvido com sucesso: {ip_address}")
+                return ip_address
+            else:
+                logger.error(f"A API DoH não conseguiu resolver o IP para {hostname}. Resposta: {data}")
+                return None
+    except Exception as e:
+        logger.error(f"Falha ao resolver o IP para {hostname} via DoH: {e}")
+        return None
+
 # --- Funções de Execução de Ordem ---
 async def execute_swap(input_mint_str, output_mint_str, amount, input_decimals, slippage_bps=500):
-    global http_client
+    global http_client, jupiter_api_ip
     logger.info(f"--- INICIANDO PROCESSO DE SWAP ---")
     logger.info(f"De: {amount} {input_mint_str} | Para: {output_mint_str}")
     amount_wei = int(amount * (10**input_decimals))
     
-    for attempt in range(3):
-        try:
-            # ETAPA 1: Obter cotação
-            logger.info(f"[SWAP 1/5] Obtendo cotação da API da Jupiter (tentativa {attempt + 1}/3)...")
-            quote_url = f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint_str}&outputMint={output_mint_str}&amount={amount_wei}&slippageBps={slippage_bps}"
-            quote_res = await http_client.get(quote_url)
-            quote_res.raise_for_status()
-            quote_response = quote_res.json()
-            logger.info("[SWAP 1/5] Cotação recebida com sucesso.")
+    # Se ainda não tivermos o IP da Jupiter, resolvemo-lo agora.
+    if not jupiter_api_ip:
+        jupiter_api_ip = await resolve_ip_with_doh("quote-api.jup.ag")
+        if not jupiter_api_ip:
+            await send_telegram_message("⚠️ Não foi possível resolver o endereço da API da Jupiter. A transação não pode continuar.")
+            return None
 
-            # ETAPA 2: Obter transação
-            logger.info(f"[SWAP 2/5] Solicitando a transação de swap (tentativa {attempt + 1}/3)...")
-            swap_payload = {
-                "userPublicKey": str(payer.pubkey()),
-                "quoteResponse": quote_response,
-                "wrapAndUnwrapSol": True,
-                "prioritizationFee": parameters["priority_fee"]
-            }
-            swap_url = "https://quote-api.jup.ag/v6/swap"
-            swap_res = await http_client.post(swap_url, json=swap_payload)
-            swap_res.raise_for_status()
-            swap_response = swap_res.json()
-            swap_tx_b64 = swap_response.get('swapTransaction')
-            if not swap_tx_b64:
-                logger.error(f"[ERRO SWAP] A API da Jupiter não retornou uma transação. Resposta: {swap_response}"); return None
-            logger.info("[SWAP 2/5] Transação recebida com sucesso.")
-            
-            # ETAPA 3: Assinar a transação
-            logger.info("[SWAP 3/5] Decodificando e assinando a transação com a chave privada...")
-            raw_tx_bytes = b64decode(swap_tx_b64)
-            swap_tx = VersionedTransaction.from_bytes(raw_tx_bytes)
-            signature = payer.sign_message(to_bytes_versioned(swap_tx.message))
-            signed_tx = VersionedTransaction.populate(swap_tx.message, [signature])
-            logger.info("[SWAP 3/5] Transação assinada com sucesso.")
+    jupiter_hostname = "quote-api.jup.ag"
+    headers = {"Host": jupiter_hostname}
 
-            # ETAPA 4: Enviar para a blockchain
-            logger.info("[SWAP 4/5] Enviando a transação para a rede Solana...")
-            tx_opts = TxOpts(skip_preflight=False, preflight_commitment="confirmed")
-            tx_signature = solana_client.send_raw_transaction(bytes(signed_tx), opts=tx_opts).value
-            logger.info(f"[SWAP 4/5] Transação enviada. Assinatura: {tx_signature}")
-            
-            # ETAPA 5: Confirmar a transação
-            logger.info(f"[SWAP 5/5] Aguardando confirmação final da transação na blockchain...")
-            solana_client.confirm_transaction(tx_signature, commitment="confirmed")
-            logger.info(f"[SWAP 5/5] SUCESSO! Transação confirmada: https://solscan.io/tx/{tx_signature}")
-            
-            return str(tx_signature)
+    try:
+        # ETAPA 1: Obter cotação
+        logger.info(f"[SWAP 1/5] Obtendo cotação da API da Jupiter...")
+        quote_url = f"https://{jupiter_api_ip}/v6/quote?inputMint={input_mint_str}&outputMint={output_mint_str}&amount={amount_wei}&slippageBps={slippage_bps}"
+        quote_res = await http_client.get(quote_url, headers=headers)
+        quote_res.raise_for_status()
+        quote_response = quote_res.json()
+        logger.info("[SWAP 1/5] Cotação recebida com sucesso.")
 
-        except httpx.ConnectError as e:
-            logger.error(f"[ERRO DE CONEXÃO SWAP] Falha ao conectar à Jupiter (tentativa {attempt + 1}/3): {e}")
-            if attempt < 2:
-                await asyncio.sleep(2) # Espera 2 segundos antes de tentar novamente
-                continue
-            else:
-                logger.critical("[ERRO SWAP] Falha crítica após 3 tentativas de conexão com a Jupiter.")
-                await send_telegram_message(f"⚠️ Falha de rede persistente ao contatar a Jupiter: {e}"); return None
-        except Exception as e:
-            logger.error(f"[ERRO SWAP] Falha crítica inesperada durante o processo de swap: {e}", exc_info=True)
-            await send_telegram_message(f"⚠️ Falha na transação: {e}"); return None
-    
-    return None # Retorna None se todas as tentativas falharem
+        # ETAPA 2: Obter transação
+        logger.info(f"[SWAP 2/5] Solicitando a transação de swap...")
+        swap_payload = {
+            "userPublicKey": str(payer.pubkey()),
+            "quoteResponse": quote_response,
+            "wrapAndUnwrapSol": True,
+            "prioritizationFee": parameters["priority_fee"]
+        }
+        swap_url = f"https://{jupiter_api_ip}/v6/swap"
+        swap_res = await http_client.post(swap_url, json=swap_payload, headers=headers)
+        swap_res.raise_for_status()
+        swap_response = swap_res.json()
+        swap_tx_b64 = swap_response.get('swapTransaction')
+        if not swap_tx_b64:
+            logger.error(f"[ERRO SWAP] A API da Jupiter não retornou uma transação. Resposta: {swap_response}"); return None
+        logger.info("[SWAP 2/5] Transação recebida com sucesso.")
+        
+        # ETAPA 3: Assinar a transação
+        logger.info("[SWAP 3/5] Decodificando e assinando a transação...")
+        raw_tx_bytes = b64decode(swap_tx_b64)
+        swap_tx = VersionedTransaction.from_bytes(raw_tx_bytes)
+        signature = payer.sign_message(to_bytes_versioned(swap_tx.message))
+        signed_tx = VersionedTransaction.populate(swap_tx.message, [signature])
+        logger.info("[SWAP 3/5] Transação assinada.")
+
+        # ETAPA 4: Enviar para a blockchain
+        logger.info("[SWAP 4/5] Enviando a transação para a rede Solana...")
+        tx_opts = TxOpts(skip_preflight=False, preflight_commitment="confirmed")
+        tx_signature = solana_client.send_raw_transaction(bytes(signed_tx), opts=tx_opts).value
+        logger.info(f"[SWAP 4/5] Transação enviada. Assinatura: {tx_signature}")
+        
+        # ETAPA 5: Confirmar a transação
+        logger.info(f"[SWAP 5/5] Aguardando confirmação final...")
+        solana_client.confirm_transaction(tx_signature, commitment="confirmed")
+        logger.info(f"[SWAP 5/5] SUCESSO! Transação confirmada: https://solscan.io/tx/{tx_signature}")
+        
+        return str(tx_signature)
+
+    except Exception as e:
+        logger.error(f"[ERRO SWAP] Falha crítica durante o processo de swap: {e}", exc_info=True)
+        await send_telegram_message(f"⚠️ Falha na transação: {e}"); return None
 
 async def execute_buy_order(amount, price, reason="Compra Manual"):
     global in_position, entry_price, monitor_task
@@ -170,13 +190,13 @@ async def execute_buy_order(amount, price, reason="Compra Manual"):
                        f"Entrada: {price:.10f} | Alvo: {price * (1 + parameters['take_profit_percent']/100):.10f} | "
                        f"Stop: {price * (1 - parameters['stop_loss_percent']/100):.10f}\n"
                        f"https://solscan.io/tx/{tx_sig}")
-        logger.info(f"Compra para {pair_details['base_symbol']} bem-sucedida. Iniciando monitoramento de posição.")
+        logger.info(f"Compra para {pair_details['base_symbol']} bem-sucedida. Iniciando monitoramento.")
         await send_telegram_message(log_message)
 
         if monitor_task is None or monitor_task.done():
             monitor_task = asyncio.create_task(monitor_position())
     else:
-        logger.error(f"FALHA NA EXECUÇÃO da compra para {pair_details['base_symbol']}. A transação não foi confirmada.")
+        logger.error(f"FALHA NA EXECUÇÃO da compra para {pair_details['base_symbol']}.")
         await send_telegram_message(f"❌ FALHA NA EXECUÇÃO da compra para **{pair_details['base_symbol']}**.")
 
 async def execute_sell_order(reason=""):
@@ -219,8 +239,8 @@ async def execute_sell_order(reason=""):
                 monitor_task.cancel()
                 monitor_task = None
         else:
-            logger.error(f"FALHA NA VENDA do token {symbol}. A transação não foi confirmada. O bot permanecerá em posição.")
-            await send_telegram_message(f"❌ FALHA NA VENDA do token {symbol}. Use /sell para tentar novamente ou /stop para parar o bot.")
+            logger.error(f"FALHA NA VENDA do token {symbol}. O bot permanecerá em posição.")
+            await send_telegram_message(f"❌ FALHA NA VENDA do token {symbol}. Use /sell para tentar novamente.")
 
     except Exception as e:
         logger.error(f"Erro crítico durante a execução da venda de {symbol}: {e}", exc_info=True)
@@ -244,7 +264,7 @@ async def get_pair_details(pair_address, client=None):
             pair_data = data.get('pair')
             
             if not pair_data:
-                logger.warning(f"Endereço {pair_address} não encontrado na DexScreener. A API não retornou o 'par'.")
+                logger.warning(f"Endereço {pair_address} não encontrado na DexScreener.")
                 return None
             
             logger.info(f"Detalhes de {pair_data['baseToken']['symbol']} obtidos com sucesso.")
@@ -288,13 +308,13 @@ async def monitor_position():
             if current_price <= stop_loss_price:
                 logger.info("CONDIÇÃO DE STOP LOSS ATINGIDA. A iniciar venda.")
                 await execute_sell_order(f"Stop Loss (-{parameters['stop_loss_percent']}%)")
-                continue # Sai do loop após a ordem de venda
+                continue
 
             logger.info(f"Verificando Take Profit: {current_price:.10f} >= {take_profit_price:.10f}?")
             if current_price >= take_profit_price:
                 logger.info("CONDIÇÃO DE TAKE PROFIT ATINGIDA. A iniciar venda.")
                 await execute_sell_order(f"Take Profit (+{parameters['take_profit_percent']}%)")
-                continue # Sai do loop após a ordem de venda
+                continue
             
             await asyncio.sleep(15)
         except asyncio.CancelledError:
@@ -313,7 +333,7 @@ async def start(update, context):
         '3. Use `/buy <VALOR_SOL>` para comprar.\n'
         '4. Use `/sell` para vender a qualquer momento.\n'
         '5. Use `/status` para ver a sua posição.\n'
-        '6. Use `/stop` para desligar o bot (vende a posição se estiver aberta).',
+        '6. Use `/stop` para desligar o bot.',
         parse_mode='Markdown'
     )
 
@@ -327,8 +347,7 @@ async def set_params(update, context):
         pair_address, stop_loss, take_profit = args[0], float(args[1]), float(args[2])
         
         logger.info(f"A validar o endereço do contrato: {pair_address}")
-        # --- ALTERAÇÃO: USA O NOVO TRANSPORTE DoH PARA VERIFICAÇÃO ---
-        async with DOHClient(timeout=10.0) as temp_client:
+        async with httpx.AsyncClient(timeout=10.0) as temp_client:
             pair_details = await get_pair_details(pair_address, client=temp_client)
 
         if not pair_details:
@@ -366,9 +385,8 @@ async def run_bot(update, context):
         logger.warning("Comando /run ignorado, bot já em execução.")
         await update.effective_message.reply_text("O bot já está em execução."); return
     
-    # --- ALTERAÇÃO: INICIA O CLIENTE HTTP COM O TRANSPORTE DoH ---
-    logger.info("Iniciando o cliente de rede principal (httpx) com resolvedor DNS-over-HTTPS...")
-    http_client = DOHClient(timeout=30.0)
+    logger.info("Iniciando o cliente de rede principal (httpx)...")
+    http_client = httpx.AsyncClient(timeout=30.0)
     
     bot_running = True
     logger.info("Bot alterado para o estado 'em execução'.")
@@ -491,7 +509,6 @@ def main():
     keep_alive()
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Adicionando os handlers dos comandos
     logger.info("Configurando os handlers dos comandos do Telegram...")
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("set", set_params))
