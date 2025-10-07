@@ -263,10 +263,14 @@ async def start(update, context):
 
 async def set_params(update, context):
     global parameters
-    if bot_running: await update.effective_message.reply_text("Pare o bot com /stop antes de alterar os parâmetros."); return
+    if bot_running:
+        await update.effective_message.reply_text("Pare o bot com /stop antes de alterar os parâmetros.")
+        return
     try:
+        # Posições: 0:TOKEN, 1:COTAÇÃO, 2:VALOR, 3:TP_%, 4:TS_%
         if len(context.args) != 5:
-            await update.effective_message.reply_text("⚠️ *Erro: Formato incorreto.*\nUse: `/set <TOKEN> <COTAÇÃO> <VALOR> <TP_%> <TS_%>`", parse_mode='Markdown'); return
+            await update.effective_message.reply_text("⚠️ *Erro: Formato incorreto.*\nUse: `/set <TOKEN> <COTAÇÃO> <VALOR> <TP_%> <TS_%>`", parse_mode='Markdown')
+            return
         
         base_token_contract = context.args[0]
         quote_symbol_input = context.args[1].upper()
@@ -278,17 +282,25 @@ async def set_params(update, context):
         
         token_search_url = f"https://api.dexscreener.com/latest/dex/tokens/{base_token_contract}"
         async with httpx.AsyncClient() as client:
-            response = await client.get(token_search_url); response.raise_for_status(); token_res = response.json()
+            response = await client.get(token_search_url)
+            response.raise_for_status()
+            token_res = response.json()
         
-        if not token_res.get('pairs'): await update.effective_message.reply_text(f"⚠️ Nenhum par encontrado para este contrato."); return
+        if not token_res.get('pairs'):
+            await update.effective_message.reply_text(f"⚠️ Nenhum par encontrado para este contrato.")
+            return
+            
         accepted_symbols = [quote_symbol_input]
         if quote_symbol_input == 'SOL': accepted_symbols.append('WSOL')
         
         valid_pairs = [p for p in token_res['pairs'] if p.get('quoteToken', {}).get('symbol') in accepted_symbols]
-        if not valid_pairs: await update.effective_message.reply_text(f"⚠️ Nenhum par com `{quote_symbol_input}` encontrado."); return
+        if not valid_pairs:
+            await update.effective_message.reply_text(f"⚠️ Nenhum par com `{quote_symbol_input}` encontrado.")
+            return
         
         trade_pair = max(valid_pairs, key=lambda p: p.get('liquidity', {}).get('usd', 0))
-        base_token_symbol = trade_pair['baseToken']['symbol'].lstrip('$'); quote_token_symbol = trade_pair['quoteToken']['symbol']
+        base_token_symbol = trade_pair['baseToken']['symbol'].lstrip('$')
+        quote_token_symbol = trade_pair['quoteToken']['symbol']
         
         parameters = {
             "base_token_symbol": base_token_symbol, "quote_token_symbol": quote_token_symbol,
@@ -301,19 +313,41 @@ async def set_params(update, context):
                 "quote_decimals": 9 if quote_token_symbol in ['SOL', 'WSOL'] else 6 
             }
         }
-        await update.effective_message.reply_text(
+        
+        # --- BLOCO DE MENSAGEM À PROVA DE FALHAS ---
+        logger.info(f"Parâmetros definidos: {parameters}. Tentando enviar confirmação...")
+
+        # Mensagem formatada
+        formatted_message = (
             f"✅ *Parâmetros definidos!*\n\n"
             f"🪙 *Par Encontrado:* `{base_token_symbol}/{quote_token_symbol}`\n"
             f"*Endereço do Par:* `{trade_pair['pairAddress']}`\n"
             f"💰 *Valor/Ordem:* `{amount}` {quote_symbol_input}\n"
             f"📈 *Take Profit:* `{take_profit_percent}%`\n"
-            f"📉 *Trailing Stop:* `{trailing_stop_percent}%`", parse_mode='Markdown')
-        logger.info(f"Parâmetros definidos: {parameters}")
+            f"📉 *Trailing Stop:* `{trailing_stop_percent}%`"
+        )
+        
+        try:
+            # Tenta enviar a mensagem bonita
+            await update.effective_message.reply_text(formatted_message, parse_mode='Markdown')
+            logger.info("Mensagem de confirmação formatada enviada com sucesso.")
+        except Exception as e_msg:
+            # Se falhar, envia uma versão simples
+            logger.warning(f"Falha ao enviar mensagem formatada ({e_msg}). Enviando como texto simples.")
+            plain_text_message = (
+                f"Parametros definidos!\n\n"
+                f"Par Encontrado: {base_token_symbol}/{quote_token_symbol}\n"
+                f"Endereco do Par: {trade_pair['pairAddress']}\n"
+                f"Valor/Ordem: {amount} {quote_symbol_input}\n"
+                f"Take Profit: {take_profit_percent}%\n"
+                f"Trailing Stop: {trailing_stop_percent}%"
+            )
+            await update.effective_message.reply_text(plain_text_message)
+            logger.info("Mensagem de confirmação em texto simples enviada com sucesso.")
+            
     except Exception as e: 
-        logger.error(f"Erro em set_params: {e}", exc_info=True)
-        await update.effective_message.reply_text(f"⚠️ Erro ao configurar: {e}")
-
-async def run_bot(update, context):
+        logger.error(f"Erro crítico em set_params: {e}", exc_info=True)
+        await update.effective_message.reply_text(f"⚠️ Erro ao configurar: {e}")async def run_bot(update, context):
     global bot_running, periodic_task
     if not parameters["trade_pair_details"]: await update.effective_message.reply_text("Defina os parâmetros com /set primeiro."); return
     if bot_running: await update.effective_message.reply_text("O bot já está em execução."); return
