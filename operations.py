@@ -7,7 +7,10 @@ import os
 from dotenv import load_dotenv
 import asyncio
 from base64 import b64decode
+import pandas as pd
+import pandas_ta as ta
 import httpx
+from datetime import datetime, timezone
 
 # --- Libs da Solana ---
 from solders.pubkey import Pubkey
@@ -27,7 +30,6 @@ app = Flask('')
 def home():
     return "Bot is alive!"
 def run_server():
-  logger.info("Iniciando servidor Flask para manter o bot ativo.")
   app.run(host='0.0.0.0',port=8080)
 def keep_alive():
     t = Thread(target=run_server)
@@ -42,488 +44,490 @@ CHAT_ID = os.getenv("CHAT_ID")
 PRIVATE_KEY_B58 = os.getenv("PRIVATE_KEY_BASE58")
 RPC_URL = os.getenv("RPC_URL")
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', handlers=[logging.StreamHandler()])
-logger = logging.getLogger(__name__)
-
 if not all([TELEGRAM_TOKEN, CHAT_ID, PRIVATE_KEY_B58, RPC_URL]):
-    logger.critical("ERRO FATAL: Uma ou mais variáveis de ambiente não estão definidas.")
+    print("Erro: Verifique se todas as variáveis de ambiente estão definidas.")
     exit()
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', handlers=[logging.StreamHandler()])
+logger = logging.getLogger(__name__)
 
 # --- CLIENTES PERSISTENTES ---
 solana_client = None
-http_client = None
+http_client = None # Cliente de rede global
 
 try:
-    logger.info("Conectando ao RPC da Solana e carregando a carteira...")
     solana_client = Client(RPC_URL)
     payer = Keypair.from_base58_string(PRIVATE_KEY_B58)
     logger.info(f"Carteira carregada com sucesso. Endereço público: {payer.pubkey()}")
 except Exception as e:
-    logger.critical(f"ERRO FATAL ao carregar a carteira Solana: {e}")
+    logger.error(f"Erro ao carregar a carteira Solana: {e}")
     exit()
 
 # --- Variáveis Globais de Estado ---
 bot_running = False
 in_position = False
 entry_price = 0.0
-monitor_task = None
+periodic_task = None
 application = None
-jupiter_api_ip = None # Variável para armazenar o IP da Jupiter
+sell_fail_count = 0
+buy_fail_count = 0
+
+automation_state = {
+    "current_target_pair_address": None,
+    "current_target_symbol": None,
+    "current_target_pair_details": None,
+    "last_scan_timestamp": 0,
+    "position_opened_timestamp": 0,
+    "target_selected_timestamp": 0,
+    "penalty_box": {},
+    "discovered_pairs": {},
+    "last_price_change_pct": None,
+    "last_price_change_timestamp": 0,
+    "checking_volatility": False,
+    "volatility_check_start_time": 0,
+    "volatility_check_passed": False
+}
 
 parameters = {
-    "pair_address": None,
-    "pair_details": None,
+    "timeframe": "1m",
+    "amount": None,
     "stop_loss_percent": None,
     "take_profit_percent": None,
     "priority_fee": 2000000
 }
 
-# --- FUNÇÃO DE RESOLUÇÃO DE DNS MANUAL (USANDO GOOGLE) ---
-async def resolve_ip_with_doh(hostname):
-    """Resolve o IP de um hostname usando a API DNS-over-HTTPS da Google."""
-    logger.info(f"Resolvendo o IP para {hostname} usando DNS-over-HTTPS da Google...")
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                "https://dns.google/resolve",
-                params={"name": hostname, "type": "A"},
-            )
-            response.raise_for_status()
-            data = response.json()
-            # A API da Google retorna 'Answer' mesmo em caso de falha, então verificamos o status primeiro
-            if data.get("Status") == 0 and "Answer" in data:
-                # Procura pelo primeiro registo do tipo 'A'
-                for answer in data["Answer"]:
-                    if answer.get("type") == 1: # Tipo 1 é um registo A (endereço IPv4)
-                        ip_address = answer["data"]
-                        logger.info(f"IP para {hostname} resolvido com sucesso: {ip_address}")
-                        return ip_address
-                logger.error(f"A API DoH da Google não retornou um registo 'A' para {hostname}. Resposta: {data}")
-                return None
-            else:
-                logger.error(f"A API DoH da Google não conseguiu resolver o IP para {hostname}. Resposta: {data}")
-                return None
-    except Exception as e:
-        logger.error(f"Falha ao resolver o IP para {hostname} via DoH da Google: {e}")
-        return None
-
 # --- Funções de Execução de Ordem ---
-async def execute_swap(input_mint_str, output_mint_str, amount, input_decimals, slippage_bps=500):
-    global http_client, jupiter_api_ip
-    logger.info(f"--- INICIANDO PROCESSO DE SWAP ---")
-    logger.info(f"De: {amount} {input_mint_str} | Para: {output_mint_str}")
+async def execute_swap(input_mint_str, output_mint_str, amount, input_decimals, slippage_bps):
+    global http_client
+    logger.info(f"Iniciando swap de {amount} do token {input_mint_str} para {output_mint_str}...")
     amount_wei = int(amount * (10**input_decimals))
     
-    # Se ainda não tivermos o IP da Jupiter, resolvemo-lo agora.
-    if not jupiter_api_ip:
-        jupiter_api_ip = await resolve_ip_with_doh("quote-api.jup.ag")
-        if not jupiter_api_ip:
-            await send_telegram_message("⚠️ Não foi possível resolver o endereço da API da Jupiter. A transação não pode continuar.")
-            return None
-
-    jupiter_hostname = "quote-api.jup.ag"
-    headers = {"Host": jupiter_hostname}
-
     try:
-        # ETAPA 1: Obter cotação
-        logger.info(f"[SWAP 1/5] Obtendo cotação da API da Jupiter...")
-        quote_url = f"https://{jupiter_api_ip}/v6/quote?inputMint={input_mint_str}&outputMint={output_mint_str}&amount={amount_wei}&slippageBps={slippage_bps}"
-        quote_res = await http_client.get(quote_url, headers=headers)
+        quote_url = f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint_str}&outputMint={output_mint_str}&amount={amount_wei}&slippageBps={slippage_bps}&maxAccounts=64"
+        quote_res = await http_client.get(quote_url) # USA O CLIENTE GLOBAL
         quote_res.raise_for_status()
         quote_response = quote_res.json()
-        logger.info("[SWAP 1/5] Cotação recebida com sucesso.")
 
-        # ETAPA 2: Obter transação
-        logger.info(f"[SWAP 2/5] Solicitando a transação de swap...")
+        priority_fee = parameters.get("priority_fee")
+        
         swap_payload = {
             "userPublicKey": str(payer.pubkey()),
             "quoteResponse": quote_response,
             "wrapAndUnwrapSol": True,
-            "prioritizationFee": parameters["priority_fee"]
+            "dynamicComputeUnitLimit": True,
+            "prioritizationFee": priority_fee
         }
-        swap_url = f"https://{jupiter_api_ip}/v6/swap"
-        swap_res = await http_client.post(swap_url, json=swap_payload, headers=headers)
+        
+        swap_url = "https://quote-api.jup.ag/v6/swap"
+        swap_res = await http_client.post(swap_url, json=swap_payload) # USA O CLIENTE GLOBAL
         swap_res.raise_for_status()
         swap_response = swap_res.json()
         swap_tx_b64 = swap_response.get('swapTransaction')
         if not swap_tx_b64:
-            logger.error(f"[ERRO SWAP] A API da Jupiter não retornou uma transação. Resposta: {swap_response}"); return None
-        logger.info("[SWAP 2/5] Transação recebida com sucesso.")
+            logger.error(f"Erro na API da Jupiter: {swap_response}"); return None
         
-        # ETAPA 3: Assinar a transação
-        logger.info("[SWAP 3/5] Decodificando e assinando a transação...")
         raw_tx_bytes = b64decode(swap_tx_b64)
         swap_tx = VersionedTransaction.from_bytes(raw_tx_bytes)
         signature = payer.sign_message(to_bytes_versioned(swap_tx.message))
         signed_tx = VersionedTransaction.populate(swap_tx.message, [signature])
-        logger.info("[SWAP 3/5] Transação assinada.")
 
-        # ETAPA 4: Enviar para a blockchain
-        logger.info("[SWAP 4/5] Enviando a transação para a rede Solana...")
-        tx_opts = TxOpts(skip_preflight=False, preflight_commitment="confirmed")
+        tx_opts = TxOpts(skip_preflight=True, preflight_commitment="processed")
         tx_signature = solana_client.send_raw_transaction(bytes(signed_tx), opts=tx_opts).value
-        logger.info(f"[SWAP 4/5] Transação enviada. Assinatura: {tx_signature}")
         
-        # ETAPA 5: Confirmar a transação
-        logger.info(f"[SWAP 5/5] Aguardando confirmação final...")
+        logger.info(f"Transação enviada: {tx_signature}")
+        await asyncio.sleep(12)
         solana_client.confirm_transaction(tx_signature, commitment="confirmed")
-        logger.info(f"[SWAP 5/5] SUCESSO! Transação confirmada: https://solscan.io/tx/{tx_signature}")
+        logger.info(f"Transação confirmada: https://solscan.io/tx/{tx_signature}")
         
         return str(tx_signature)
 
     except Exception as e:
-        logger.error(f"[ERRO SWAP] Falha crítica durante o processo de swap: {e}", exc_info=True)
-        await send_telegram_message(f"⚠️ Falha na transação: {e}"); return None
+        logger.error(f"Falha na transação: {e}"); await send_telegram_message(f"⚠️ Falha na transação: {e}"); return None
 
-async def execute_buy_order(amount, price, reason="Compra Manual"):
-    global in_position, entry_price, monitor_task
-    logger.info(f"Recebida ordem de compra para {amount} SOL.")
-    if in_position:
-        logger.warning("Compra ignorada: já existe uma posição aberta.")
-        await send_telegram_message("⚠️ Já existe uma posição aberta."); return
+async def execute_buy_order(amount, price, pair_details, manual=False, reason="Sinal da Estratégia"):
+    global in_position, entry_price, sell_fail_count, buy_fail_count
+    if in_position: return
 
-    pair_details = parameters["pair_details"]
-    logger.info(f"Iniciando processo de compra para {pair_details['base_symbol']} ao preço de {price}")
+    if not manual:
+        logger.info(f"Verificação final de cotação para {pair_details['base_symbol']} antes da compra...")
+        if not await is_pair_quotable_on_jupiter(pair_details):
+            logger.error(f"FALHA NA COMPRA: Par {pair_details['base_symbol']} deixou de ser negociável na Jupiter.")
+            await send_telegram_message(f"❌ Compra para **{pair_details['base_symbol']}** abortada. Moeda não mais negociável.")
+            automation_state["penalty_box"][automation_state["current_target_pair_address"]] = 10
+            automation_state["current_target_pair_address"] = None
+            return
+
+    slippage_bps = await calculate_dynamic_slippage(pair_details['pair_address'])
+    logger.info(f"EXECUTANDO ORDEM DE COMPRA de {amount} SOL para {pair_details['base_symbol']} ao preço de {price}")
     
-    tx_sig = await execute_swap(pair_details['quote_address'], pair_details['base_address'], amount, 9)
+    tx_sig = await execute_swap(pair_details['quote_address'], pair_details['base_address'], amount, 9, slippage_bps)
 
     if tx_sig:
         in_position = True
         entry_price = price
+        automation_state["position_opened_timestamp"] = time.time()
+        sell_fail_count = 0
+        buy_fail_count = 0
         log_message = (f"✅ COMPRA REALIZADA: {amount} SOL para {pair_details['base_symbol']}\n"
                        f"Motivo: {reason}\n"
                        f"Entrada: {price:.10f} | Alvo: {price * (1 + parameters['take_profit_percent']/100):.10f} | "
                        f"Stop: {price * (1 - parameters['stop_loss_percent']/100):.10f}\n"
+                       f"Slippage Usado: {slippage_bps/100:.2f}%\n"
                        f"https://solscan.io/tx/{tx_sig}")
-        logger.info(f"Compra para {pair_details['base_symbol']} bem-sucedida. Iniciando monitoramento.")
+        logger.info(log_message)
         await send_telegram_message(log_message)
-
-        if monitor_task is None or monitor_task.done():
-            monitor_task = asyncio.create_task(monitor_position())
     else:
-        logger.error(f"FALHA NA EXECUÇÃO da compra para {pair_details['base_symbol']}.")
-        await send_telegram_message(f"❌ FALHA NA EXECUÇÃO da compra para **{pair_details['base_symbol']}**.")
+        buy_fail_count += 1
+        logger.error(f"FALHA NA EXECUÇÃO da compra para {pair_details['base_symbol']}. Tentativa {buy_fail_count}/10.")
+        if buy_fail_count >= 10:
+            logger.error(f"Limite de {buy_fail_count} falhas de compra atingido. Penalizando e procurando novo alvo.")
+            await send_telegram_message(f"❌ FALHA NA EXECUÇÃO da compra para **{pair_details['base_symbol']}**. Limite atingido.")
+            if automation_state.get("current_target_pair_address"):
+                automation_state["penalty_box"][automation_state["current_target_pair_address"]] = 10
+                automation_state["current_target_pair_address"] = None
+            buy_fail_count = 0
 
 async def execute_sell_order(reason=""):
-    global in_position, entry_price, monitor_task
-    logger.info(f"Recebida ordem de venda. Motivo: {reason}")
-    if not in_position:
-        logger.warning("Venda ignorada: nenhuma posição aberta.")
-        return
+    global in_position, entry_price, sell_fail_count, buy_fail_count
+    if not in_position: return
     
-    pair_details = parameters["pair_details"]
+    pair_details = automation_state.get('current_target_pair_details', {})
     symbol = pair_details.get('base_symbol', 'TOKEN')
-    logger.info(f"Iniciando processo de venda para {symbol}.")
+    logger.info(f"EXECUTANDO ORDEM DE VENDA de {symbol}. Motivo: {reason}")
     try:
-        logger.info(f"A obter saldo do token {symbol}...")
         token_mint_pubkey = Pubkey.from_string(pair_details['base_address'])
         ata_address = get_associated_token_address(payer.pubkey(), token_mint_pubkey)
         
         balance_response = solana_client.get_token_account_balance(ata_address)
-        token_balance_data = balance_response.value
-        amount_to_sell = token_balance_data.ui_amount
-        logger.info(f"Saldo encontrado: {amount_to_sell} {symbol}.")
 
-        if amount_to_sell is None or amount_to_sell == 0:
-            logger.warning("Tentativa de venda com saldo zero. Resetando estado da posição.")
-            in_position = False; entry_price = 0.0
+        if hasattr(balance_response, 'value'):
+            token_balance_data = balance_response.value
+        else:
+            logger.error(f"Erro ao obter saldo do token {symbol}: Resposta RPC inválida.")
+            # Lógica de falha de venda simplificada
             return
 
-        tx_sig = await execute_swap(pair_details['base_address'], pair_details['quote_address'], amount_to_sell, token_balance_data.decimals)
+        amount_to_sell = token_balance_data.ui_amount
+        if amount_to_sell is None or amount_to_sell == 0:
+            logger.warning("Tentativa de venda com saldo zero, resetando posição.")
+            in_position = False; entry_price = 0.0; automation_state["current_target_pair_address"] = None
+            return
+
+        slippage_bps = await calculate_dynamic_slippage(pair_details['pair_address'])
+        tx_sig = await execute_swap(pair_details['base_address'], pair_details['quote_address'], amount_to_sell, token_balance_data.decimals, slippage_bps)
         
         if tx_sig:
-            log_message = (f"🛑 VENDA REALIZADA: {symbol}\n"
-                           f"Motivo: {reason}\n"
-                           f"https://solscan.io/tx/{tx_sig}")
-            logger.info(f"Venda de {symbol} bem-sucedida. Posição fechada.")
+            log_message = (f"🛑 VENDA REALIZADA: {symbol}\nMotivo: {reason}\nhttps://solscan.io/tx/{tx_sig}")
+            logger.info(log_message)
             await send_telegram_message(log_message)
-            in_position = False; entry_price = 0.0
-            
-            if monitor_task:
-                logger.info("Cancelando tarefa de monitoramento de posição.")
-                monitor_task.cancel()
-                monitor_task = None
+            in_position = False; entry_price = 0.0; automation_state["current_target_pair_address"] = None
+            sell_fail_count = 0; buy_fail_count = 0
         else:
             logger.error(f"FALHA NA VENDA do token {symbol}. O bot permanecerá em posição.")
-            await send_telegram_message(f"❌ FALHA NA VENDA do token {symbol}. Use /sell para tentar novamente.")
+            await send_telegram_message(f"❌ FALHA NA VENDA do token {symbol}. Tente novamente.")
 
     except Exception as e:
-        logger.error(f"Erro crítico durante a execução da venda de {symbol}: {e}", exc_info=True)
+        logger.error(f"Erro crítico ao vender {symbol}: {e}")
         await send_telegram_message(f"⚠️ Erro crítico ao vender {symbol}: {e}")
 
-# --- Funções de Análise e Monitoramento ---
-async def get_pair_details(pair_address, client=None):
-    http = client if client else http_client
-    if not http:
-        logger.error("Erro fatal: cliente HTTP não está disponível para get_pair_details.")
+# --- Funções de Análise e Descoberta ---
+async def fetch_geckoterminal_ohlcv(pair_address, timeframe, limit=60):
+    global http_client
+    timeframe_map = {"1m": "minute"}
+    gt_timeframe = timeframe_map.get(timeframe)
+    if not gt_timeframe: return None
+    url = f"https://api.geckoterminal.com/api/v2/networks/solana/pools/{pair_address}/ohlcv/{gt_timeframe}?aggregate=1&limit={limit}"
+    try:
+        res = await http_client.get(url) # USA O CLIENTE GLOBAL
+        res.raise_for_status()
+        data = res.json()
+        if data.get('data') and data['data'].get('attributes', {}).get('ohlcv_list'):
+            df = pd.DataFrame(data['data']['attributes']['ohlcv_list'], columns=['ts', 'o', 'h', 'l', 'c', 'v'])
+            df.rename(columns={'o': 'open', 'h': 'high', 'l': 'low', 'c': 'close', 'v': 'volume'}, inplace=True)
+            return df
         return None
-        
+    except Exception: return None
+
+async def fetch_dexscreener_real_time_price(pair_address):
+    global http_client
     url = f"https://api.dexscreener.com/latest/dex/pairs/solana/{pair_address}"
+    try:
+        res = await http_client.get(url) # USA O CLIENTE GLOBAL
+        res.raise_for_status()
+        pair_data = res.json().get('pair')
+        if pair_data:
+            return float(pair_data.get('priceNative', 0)), float(pair_data.get('priceUsd', 0))
+        return None, None
+    except Exception: return None, None
+
+async def get_pair_details(pair_address, client=None):
+    # Permite usar um cliente temporário ou o global
+    http = client if client else http_client
+    url = f"https://api.dexscreener.com/latest/dex/pairs/solana/{pair_address}"
+    try:
+        res = await http.get(url)
+        res.raise_for_status()
+        pair_data = res.json().get('pair')
+        if not pair_data: return None
+        return {"pair_address": pair_data['pairAddress'], "base_symbol": pair_data['baseToken']['symbol'], "quote_symbol": pair_data['quoteToken']['symbol'], "base_address": pair_data['baseToken']['address'], "quote_address": pair_data['quoteToken']['address']}
+    except Exception: return None
+
+async def is_pair_quotable_on_jupiter(pair_details):
+    global http_client
+    if not pair_details: return False
+    test_amount_wei = 10000
+    url = f"https://quote-api.jup.ag/v6/quote?inputMint={pair_details['quote_address']}&outputMint={pair_details['base_address']}&amount={test_amount_wei}"
+    try:
+        res = await http_client.get(url) # USA O CLIENTE GLOBAL
+        return res.status_code == 200
+    except Exception:
+        return False
+
+async def calculate_dynamic_slippage(pair_address):
+    logger.info(f"Calculando slippage dinâmico para {pair_address}...")
+    df = await fetch_geckoterminal_ohlcv(pair_address, "1m", limit=5)
+    if df is None or len(df) < 5:
+        logger.warning("Dados insuficientes. Usando slippage padrão (5.0%).")
+        return 500
+    price_range = df['high'].max() - df['low'].min()
+    volatility = (price_range / df['low'].min()) * 100 if df['low'].min() > 0 else 0
+    slippage_bps = 1000 if volatility > 10.0 else 500
+    logger.info(f"Volatilidade ({volatility:.2f}%). Slippage definido para {slippage_bps/100:.2f}%.")
+    return slippage_bps
+
+async def discover_and_filter_pairs():
+    global http_client
+    logger.info("--- FASE 1: DESCOBERTA --- Buscando os top 200 pares no GeckoTerminal...")
+    all_pools = []
     
-    for attempt in range(3):
+    for page in range(1, 11):
+        url = f"https://api.geckoterminal.com/api/v2/networks/solana/pools?page={page}&include=base_token,quote_token"
         try:
-            logger.info(f"A buscar detalhes do par {pair_address} na DexScreener (tentativa {attempt + 1}/3)...")
-            res = await http.get(url, timeout=10.0)
+            res = await http_client.get(url) # USA O CLIENTE GLOBAL
             res.raise_for_status()
-            data = res.json()
-            pair_data = data.get('pair')
-            
-            if not pair_data:
-                logger.warning(f"Endereço {pair_address} não encontrado na DexScreener.")
-                return None
-            
-            logger.info(f"Detalhes de {pair_data['baseToken']['symbol']} obtidos com sucesso.")
-            return {
-                "pair_address": pair_data['pairAddress'], 
-                "base_symbol": pair_data['baseToken']['symbol'], 
-                "quote_symbol": pair_data['quoteToken']['symbol'], 
-                "base_address": pair_data['baseToken']['address'], 
-                "quote_address": pair_data['quoteToken']['address'],
-                "price_native": float(pair_data.get('priceNative', 0))
-            }
-        except httpx.RequestError as e:
-            logger.error(f"Erro de rede ao buscar detalhes do par (tentativa {attempt + 1}/3): {e}")
-            if attempt < 2: await asyncio.sleep(1)
-            else: await send_telegram_message(f"⚠️ Falha de rede ao verificar o contrato {pair_address} após 3 tentativas.")
+            pools_data = res.json().get('data', [])
+            if not pools_data: break
+            all_pools.extend(pools_data)
+            await asyncio.sleep(0.5)
         except Exception as e:
-            logger.error(f"Erro inesperado ao processar dados do par: {e}", exc_info=True)
-            return None
-            
-    return None
-
-async def monitor_position():
-    global in_position, entry_price
-    logger.info(f"--- MONITORAMENTO DE POSIÇÃO INICIADO para {parameters['pair_details']['base_symbol']} ---")
-    while in_position and bot_running:
+            logger.error(f"Erro ao buscar página {page} no GeckoTerminal: {e}"); break
+    
+    filtered_pairs = {}
+    logger.info(f"Encontrados {len(all_pools)} pares. Aplicando filtros...")
+    
+    for pool in all_pools:
+        rejection_reasons = []
         try:
-            latest_details = await get_pair_details(parameters["pair_address"])
-            if not latest_details:
-                logger.warning("Não foi possível obter os detalhes do par para o monitoramento. A tentar novamente em 20s.")
-                await asyncio.sleep(20)
-                continue
-            
-            current_price = latest_details["price_native"]
-            profit = ((current_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
-            logger.info(f"Monitorando {parameters['pair_details']['base_symbol']}: Preço Atual = {current_price:.10f}, P/L = {profit:+.2f}%")
+            attr = pool.get('attributes', {})
+            relationships = pool.get('relationships', {})
+            symbol = attr.get('name', 'N/A').split(' / ')[0]
+            address = attr.get('address')
 
-            take_profit_price = entry_price * (1 + parameters["take_profit_percent"] / 100)
-            stop_loss_price = entry_price * (1 - parameters["stop_loss_percent"] / 100)
+            if not attr.get('name', '').endswith(' / SOL'): rejection_reasons.append("Não é par SOL")
+            if float(attr.get('reserve_in_usd', 0)) < 50000: rejection_reasons.append("Liquidez Baixa")
+            if float(attr.get('volume_usd', {}).get('h24', 0)) < 250000: rejection_reasons.append("Volume 24h Baixo")
             
-            logger.info(f"Verificando Stop Loss: {current_price:.10f} <= {stop_loss_price:.10f}?")
-            if current_price <= stop_loss_price:
-                logger.info("CONDIÇÃO DE STOP LOSS ATINGIDA. A iniciar venda.")
-                await execute_sell_order(f"Stop Loss (-{parameters['stop_loss_percent']}%)")
-                continue
+            age_str = attr.get('pool_created_at')
+            if age_str:
+                age_dt = datetime.fromisoformat(age_str.replace('Z', '+00:00'))
+                age_hours = (datetime.now(timezone.utc) - age_dt).total_seconds() / 3600
+                if age_hours < 0.5: rejection_reasons.append("Muito Nova")
+            
+            if float(attr.get('volume_usd', {}).get('h1', 0)) < 100000: rejection_reasons.append("Volume 1h Baixo")
 
-            logger.info(f"Verificando Take Profit: {current_price:.10f} >= {take_profit_price:.10f}?")
-            if current_price >= take_profit_price:
-                logger.info("CONDIÇÃO DE TAKE PROFIT ATINGIDA. A iniciar venda.")
-                await execute_sell_order(f"Take Profit (+{parameters['take_profit_percent']}%)")
-                continue
+            if not rejection_reasons:
+                filtered_pairs[symbol] = address
+        except Exception:
+            continue
+
+    logger.info(f"Descoberta finalizada. {len(filtered_pairs)} pares passaram nos filtros.")
+    return filtered_pairs
+
+async def analyze_and_score_coin(pair_address, symbol):
+    try:
+        pair_details = await get_pair_details(pair_address)
+        if not pair_details or not await is_pair_quotable_on_jupiter(pair_details): return 0, None
+
+        df = await fetch_geckoterminal_ohlcv(pair_address, "1m", limit=15)
+        if df is None or len(df) < 15: return 0, None
+        
+        # Lógica de pontuação simplificada
+        return df['volume'].sum(), pair_details
+    except Exception: return 0, None
+
+async def find_best_coin_to_trade(candidate_pairs, penalized_pairs=set()):
+    logger.info("--- FASE 2: SELEÇÃO --- Pontuando os melhores pares...")
+    if not candidate_pairs: return None
+        
+    best_score, best_coin_info = -1, None
+    valid_candidates = {s: a for s, a in candidate_pairs.items() if a not in penalized_pairs}
+    if not valid_candidates: return None
+
+    tasks = [analyze_and_score_coin(addr, symbol) for symbol, addr in valid_candidates.items()]
+    results = await asyncio.gather(*tasks)
+
+    for (symbol, addr), (score, details) in zip(valid_candidates.items(), results):
+        if details and score > best_score:
+            best_score = score
+            best_coin_info = {"symbol": symbol, "pair_address": addr, "score": score, "details": details}
+    
+    if best_coin_info:
+        logger.info(f"--- SELEÇÃO FINALIZADA --- Melhor moeda: {best_coin_info['symbol']}")
+    else:
+        logger.warning("--- SELEÇÃO FINALIZADA --- Nenhuma moeda encontrada.")
+    return best_coin_info
+
+async def check_velocity_strategy():
+    global in_position, entry_price
+    target_address = automation_state.get("current_target_pair_address")
+    if not target_address or in_position or automation_state.get("checking_volatility"): return
+
+    pair_details = automation_state.get("current_target_pair_details")
+    data = await fetch_geckoterminal_ohlcv(target_address, parameters["timeframe"], limit=2)
+    if data is None or len(data) < 2: return
+
+    # Lógica de compra baseada em velocidade
+    price_change_pct = (data.iloc[0]['close'] - data.iloc[0]['open']) / data.iloc[0]['open'] * 100
+    if not automation_state.get("checking_volatility"):
+        logger.info(f"Moeda {pair_details['base_symbol']} selecionada. Verificando volatilidade por 3 minutos.")
+        automation_state["checking_volatility"] = True
+        automation_state["volatility_check_start_time"] = time.time()
+        await send_telegram_message(f"🔔 Alvo: **{pair_details['base_symbol']}**. Verificando volatilidade...")
+
+async def autonomous_loop():
+    global bot_running
+    logger.info("Loop autônomo iniciado.")
+    while bot_running:
+        try:
+            now = time.time()
+            if not in_position and (now - automation_state.get("last_scan_timestamp", 0) > 7200 or not automation_state.get("current_target_pair_address")):
+                # Lógica de descoberta e seleção
+                discovered_pairs = await discover_and_filter_pairs()
+                best_coin = await find_best_coin_to_trade(discovered_pairs)
+                if best_coin:
+                    automation_state.update(
+                        current_target_pair_address=best_coin["pair_address"],
+                        current_target_symbol=best_coin["symbol"],
+                        current_target_pair_details=best_coin["details"],
+                        target_selected_timestamp=now
+                    )
+                    await send_telegram_message(f"🎯 **Novo Alvo:** {best_coin['symbol']}.")
+                automation_state["last_scan_timestamp"] = now
+
+            if not in_position and automation_state.get("current_target_pair_address"):
+                # Lógica de monitoramento pré-compra e execução
+                await check_velocity_strategy()
+
+            elif in_position:
+                # Lógica de monitoramento de posição (TP/SL)
+                price, _ = await fetch_dexscreener_real_time_price(automation_state["current_target_pair_address"])
+                if price:
+                    profit = ((price - entry_price) / entry_price) * 100
+                    take_profit_price = entry_price * (1 + parameters["take_profit_percent"] / 100)
+                    stop_loss_price = entry_price * (1 - parameters["stop_loss_percent"] / 100)
+                    
+                    if price >= take_profit_price: await execute_sell_order(f"Take Profit (+{parameters['take_profit_percent']}%)")
+                    elif price <= stop_loss_price: await execute_sell_order(f"Stop Loss (-{parameters['stop_loss_percent']}%)")
             
-            await asyncio.sleep(15)
+            await asyncio.sleep(30) # Intervalo do loop principal
+
         except asyncio.CancelledError:
-            logger.info("Monitoramento de posição cancelado externamente."); break
+            logger.info("Loop autônomo cancelado."); break
         except Exception as e:
-            logger.error(f"Erro crítico no loop de monitoramento: {e}", exc_info=True); await asyncio.sleep(60)
-    logger.info("--- MONITORAMENTO DE POSIÇÃO FINALIZADO ---")
+            logger.error(f"Erro no loop autônomo: {e}"); await asyncio.sleep(60)
 
 # --- Comandos do Telegram ---
 async def start(update, context):
-    logger.info(f"Comando /start recebido do utilizador {update.effective_user.username}.")
     await update.effective_message.reply_text(
-        'Olá! Sou seu bot de operações manuais.\n\n'
-        '1. Use `/set <CONTRATO> <STOP_%> <PROFIT_%>` para definir um alvo.\n'
-        '2. Use `/run` para ligar o bot.\n'
-        '3. Use `/buy <VALOR_SOL>` para comprar.\n'
-        '4. Use `/sell` para vender a qualquer momento.\n'
-        '5. Use `/status` para ver a sua posição.\n'
-        '6. Use `/stop` para desligar o bot.',
+        'Bot v20.15\n\n'
+        'Use `/set <VALOR> <STOP> <PROFIT>` e `/run`.',
         parse_mode='Markdown'
     )
 
 async def set_params(update, context):
-    logger.info(f"Comando /set recebido com argumentos: {context.args}")
     if bot_running:
-        logger.warning("Tentativa de alterar parâmetros enquanto o bot está em execução.")
-        await update.effective_message.reply_text("Pare o bot com `/stop` antes de alterar os parâmetros."); return
+        await update.effective_message.reply_text("Pare com /stop antes de alterar."); return
     try:
         args = context.args
-        pair_address, stop_loss, take_profit = args[0], float(args[1]), float(args[2])
-        
-        logger.info(f"A validar o endereço do contrato: {pair_address}")
-        async with httpx.AsyncClient(timeout=10.0) as temp_client:
-            pair_details = await get_pair_details(pair_address, client=temp_client)
-
-        if not pair_details:
-            logger.error("A validação do contrato falhou.")
-            await update.effective_message.reply_text("⚠️ Endereço de contrato inválido ou não encontrado."); return
-        
-        logger.info(f"Contrato validado com sucesso. Símbolo: {pair_details['base_symbol']}")
-        parameters.update(
-            pair_address=pair_address,
-            pair_details=pair_details,
-            stop_loss_percent=stop_loss,
-            take_profit_percent=take_profit
-        )
-
-        await update.effective_message.reply_text(
-            f"✅ *Alvo definido para {pair_details['base_symbol']}!*\n"
-            f"🛑 *Stop Loss:* `-{stop_loss}%`\n"
-            f"🎯 *Take Profit:* `+{take_profit}%`\n\n"
-            "Use `/run` e depois `/buy <VALOR>` para começar.",
-            parse_mode='Markdown'
-        )
+        amount, stop_loss, take_profit = float(args[0]), float(args[1]), float(args[2])
+        parameters.update(amount=amount, stop_loss_percent=stop_loss, take_profit_percent=take_profit)
+        await update.effective_message.reply_text(f"✅ Parâmetros definidos: Valor={amount} SOL, Stop=-{stop_loss}%, Profit=+{take_profit}%")
     except (IndexError, ValueError):
-        logger.warning(f"Comando /set com formato incorreto: {context.args}")
-        await update.effective_message.reply_text(
-            "⚠️ *Formato incorreto.*\n"
-            "Use: `/set <CONTRATO> <STOP_%> <PROFIT_%>`\n"
-            "Ex: `/set ADDR... 5 10`",
-            parse_mode='Markdown'
-        )
+        await update.effective_message.reply_text("⚠️ Formato: `/set <VALOR> <STOP> <PROFIT>`")
 
 async def run_bot(update, context):
-    global bot_running, http_client
-    logger.info("Comando /run recebido.")
+    global bot_running, periodic_task, http_client
+    if parameters['amount'] is None:
+        await update.effective_message.reply_text("Defina os parâmetros com /set."); return
     if bot_running:
-        logger.warning("Comando /run ignorado, bot já em execução.")
-        await update.effective_message.reply_text("O bot já está em execução."); return
-    
-    logger.info("Iniciando o cliente de rede principal (httpx)...")
-    http_client = httpx.AsyncClient(timeout=30.0)
+        await update.effective_message.reply_text("Já em execução."); return
+
+    # INICIA O CLIENTE GLOBAL AQUI
+    http_client = httpx.AsyncClient(timeout=60.0)
     
     bot_running = True
-    logger.info("Bot alterado para o estado 'em execução'.")
-    await update.effective_message.reply_text("🚀 Bot iniciado! Pronto para receber comandos.")
+    logger.info("Bot autônomo iniciado.")
+    await update.effective_message.reply_text("🚀 Bot iniciado!")
+    if periodic_task is None or periodic_task.done():
+        periodic_task = asyncio.create_task(autonomous_loop())
 
 async def stop_bot(update, context):
-    global bot_running, monitor_task, http_client
-    logger.info("Comando /stop recebido.")
+    global bot_running, periodic_task, http_client
     if not bot_running:
-        logger.warning("Comando /stop ignorado, bot já parado.")
-        await update.effective_message.reply_text("O bot já está parado."); return
-    
-    await update.effective_message.reply_text("Parando o bot...")
+        await update.effective_message.reply_text("Já parado."); return
     bot_running = False
-    logger.info("Bot alterado para o estado 'parado'.")
-    
-    if monitor_task and not monitor_task.done():
-        logger.info("A cancelar a tarefa de monitoramento de posição...")
-        monitor_task.cancel()
-        monitor_task = None
-    
+    if periodic_task:
+        periodic_task.cancel()
     if in_position:
-        logger.info("Posição aberta encontrada. A iniciar venda de emergência...")
-        await execute_sell_order("Parada manual do bot")
+        await execute_sell_order("Parada manual")
     
+    # FECHA O CLIENTE GLOBAL AQUI
     if http_client:
-        logger.info("A fechar o cliente de rede principal (httpx)...")
         await http_client.aclose()
         http_client = None
-    
-    logger.info("Processo de paragem concluído.")
-    await update.effective_message.reply_text("🛑 Bot parado. Posição (se existente) foi vendida.")
+
+    logger.info("Bot parado.")
+    await update.effective_message.reply_text("🛑 Bot parado.")
 
 async def manual_buy(update, context):
-    logger.info(f"Comando /buy recebido com argumentos: {context.args}")
-    if not bot_running:
-        logger.warning("Comando /buy ignorado, bot não está em execução.")
-        await update.effective_message.reply_text("⚠️ O bot precisa estar em execução. Use `/run` primeiro."); return
+    if not bot_running or not automation_state.get("current_target_pair_address"):
+        await update.effective_message.reply_text("⚠️ Bot não está pronto ou não tem alvo."); return
     if in_position:
-        logger.warning("Comando /buy ignorado, já existe uma posição aberta.")
-        await update.effective_message.reply_text("⚠️ Já existe uma posição aberta."); return
-    if not parameters.get("pair_address"):
-        logger.warning("Comando /buy ignorado, nenhum alvo definido.")
-        await update.effective_message.reply_text("⚠️ Nenhum alvo definido. Use `/set` primeiro."); return
-        
+        await update.effective_message.reply_text("⚠️ Já em posição."); return
     try:
         amount = float(context.args[0])
-        if amount <= 0:
-            logger.warning(f"Valor de compra inválido: {amount}")
-            await update.effective_message.reply_text("⚠️ O valor deve ser positivo."); return
-
-        pair_details = parameters["pair_details"]
-        logger.info(f"A obter preço atual para a compra manual de {pair_details['base_symbol']}...")
-        latest_details = await get_pair_details(pair_details['pair_address'])
-        if not latest_details:
-            logger.error("Não foi possível obter o preço atual para a compra.")
-            await update.effective_message.reply_text("⚠️ Não foi possível obter o preço atual do alvo."); return
-        
-        current_price = latest_details['price_native']
-        logger.info(f"Preço atual obtido: {current_price}. A iniciar a execução da compra.")
-        
-        await update.effective_message.reply_text(f"Iniciando compra de {amount} SOL em {pair_details['base_symbol']}...")
-        await execute_buy_order(amount, current_price)
-
-    except (IndexError, ValueError):
-        logger.warning(f"Comando /buy com formato incorreto: {context.args}")
-        await update.effective_message.reply_text("⚠️ *Formato incorreto.*\nUse: `/buy <VALOR>`\nEx: `/buy 0.1`", parse_mode='Markdown')
-    except Exception as e:
-        logger.error(f"Erro inesperado no comando /buy: {e}", exc_info=True); await update.effective_message.reply_text(f"⚠️ Erro ao executar compra: {e}")
+        pair_details = automation_state["current_target_pair_details"]
+        price, _ = await fetch_dexscreener_real_time_price(pair_details['pair_address'])
+        if price:
+            await execute_buy_order(amount, price, pair_details, manual=True, reason="Compra Manual")
+    except Exception:
+        await update.effective_message.reply_text("⚠️ Formato: `/buy <VALOR>`")
 
 async def manual_sell(update, context):
-    logger.info("Comando /sell recebido.")
     if not in_position:
-        logger.warning("Comando /sell ignorado, nenhuma posição aberta.")
-        await update.effective_message.reply_text("⚠️ Nenhuma posição aberta para vender."); return
-    await update.effective_message.reply_text("Forçando venda manual da posição atual...")
-    await execute_sell_order(reason="Venda Manual Forçada")
-
-async def status(update, context):
-    logger.info("Comando /status recebido.")
-    if not bot_running:
-        await update.effective_message.reply_text("O bot está parado."); return
-
-    if in_position:
-        pair_details = parameters["pair_details"]
-        symbol = pair_details['base_symbol']
-        
-        logger.info(f"A obter preço atual para o status de {symbol}...")
-        latest_details = await get_pair_details(parameters["pair_address"])
-        current_price = latest_details["price_native"] if latest_details else entry_price
-        
-        profit = ((current_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
-        
-        take_profit_price = entry_price * (1 + parameters["take_profit_percent"] / 100)
-        stop_loss_price = entry_price * (1 - parameters["stop_loss_percent"] / 100)
-
-        message = (f"✅ **Posição Aberta em {symbol}**\n\n"
-                   f"Preço de Entrada: `{entry_price:.10f}`\n"
-                   f"Preço Atual: `{current_price:.10f}`\n"
-                   f"P/L Atual: `{profit:+.2f}%`\n\n"
-                   f"Take Profit: `{take_profit_price:.10f}` (+{parameters['take_profit_percent']}%)\n"
-                   f"Stop Loss: `{stop_loss_price:.10f}` (-{parameters['stop_loss_percent']}%)")
-    else:
-        message = "ℹ️ Nenhuma posição aberta. Aguardando comando de compra."
-        if parameters.get("pair_address"):
-            message += f"\nAlvo atual: **{parameters['pair_details']['base_symbol']}**"
-
-    await update.effective_message.reply_text(message, parse_mode='Markdown')
+        await update.effective_message.reply_text("⚠️ Nenhuma posição aberta."); return
+    await execute_sell_order(reason="Venda Manual")
 
 async def send_telegram_message(message):
     if application:
         try:
             await application.bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='Markdown')
         except Exception as e:
-            logger.error(f"Erro ao enviar mensagem para o Telegram: {e}")
+            logger.error(f"Erro ao enviar mensagem: {e}")
 
 def main():
     global application
-    logger.info("--- INICIANDO O BOT ---")
     keep_alive()
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    logger.info("Configurando os handlers dos comandos do Telegram...")
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("set", set_params))
     application.add_handler(CommandHandler("run", run_bot))
     application.add_handler(CommandHandler("stop", stop_bot))
     application.add_handler(CommandHandler("buy", manual_buy))
     application.add_handler(CommandHandler("sell", manual_sell))
-    application.add_handler(CommandHandler("status", status))
     
-    logger.info("Bot do Telegram pronto. A iniciar o polling...")
+    logger.info("Bot do Telegram iniciado.")
     application.run_polling()
 
 if __name__ == '__main__':
