@@ -101,13 +101,27 @@ async def fetch_dexscreener_prices(pair_address):
         logger.error(f"Erro inesperado ao buscar preço na Dexscreener: {e}", exc_info=True)
     return None
 
+# --- FUNÇÃO ATUALIZADA COM RETENTATIVAS ---
 async def get_jupiter_quote(from_mint, to_mint, amount_lamports):
     url = f"{JUPITER_API_URL}/quote?inputMint={from_mint}&outputMint={to_mint}&amount={amount_lamports}&slippageBps=500"
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, timeout=30); response.raise_for_status(); return response.json()
-    except Exception as e:
-        logger.error(f"Erro ao obter cotação da Jupiter: {e}"); return None
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(url, timeout=30)
+                response.raise_for_status()
+                return response.json()
+        except httpx.RequestError as e:
+            logger.warning(f"Tentativa {attempt + 1}/{max_retries}: Erro de rede ao obter cotação da Jupiter: {e}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(3) # Espera 3 segundos antes de tentar de novo
+            else:
+                logger.error(f"Todas as {max_retries} tentativas de contatar a Jupiter falharam.")
+                return None
+        except Exception as e:
+            logger.error(f"Erro inesperado ao obter cotação da Jupiter: {e}")
+            return None
+    return None
 
 async def execute_swap(quote_response):
     payload = {"quoteResponse": quote_response, "userPublicKey": str(wallet_pubkey), "wrapAndUnwrapSol": True}
@@ -183,7 +197,7 @@ async def execute_sell_order(reason="Comando manual"):
     if tx_hash:
         price_info = await fetch_dexscreener_prices(details['pair_address'])
         exit_price = price_info['price_usd'] if price_info else entry_price
-        profit_percent = ((exit_price - entry_price) / entry_price) * 100
+        profit_percent = ((exit_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
         
         logger.info(f"VENDA EXECUTADA: {details['base_symbol']} @ ${exit_price:.8f}. Lucro/Prejuízo: {profit_percent:.2f}%. TX: {tx_hash}")
         await send_telegram_message(
