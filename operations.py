@@ -36,7 +36,6 @@ def keep_alive():
 load_dotenv()
 
 # --- Configurações de Log ---
-# Configura o log para imprimir no console com formato detalhado
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -67,9 +66,9 @@ except Exception as e:
 bot_running = False
 in_position = False
 entry_price = 0.0
-position_high_price = 0.0 # Usado para o trailing stop
+position_high_price = 0.0
 application = None
-check_interval_seconds = 60 # Fixo em 60 segundos
+check_interval_seconds = 60
 periodic_task = None
 parameters = {
     "base_token_symbol": None, "quote_token_symbol": None, "amount": None,
@@ -103,7 +102,7 @@ async def fetch_dexscreener_prices(pair_address):
     return None
 
 async def get_jupiter_quote(from_mint, to_mint, amount_lamports):
-    url = f"{JUPITER_API_URL}/quote?inputMint={from_mint}&outputMint={to_mint}&amount={amount_lamports}&slippageBps=500" # Slippage de 5%
+    url = f"{JUPITER_API_URL}/quote?inputMint={from_mint}&outputMint={to_mint}&amount={amount_lamports}&slippageBps=500"
     try:
         async with httpx.AsyncClient() as client:
             response = await client.get(url, timeout=30); response.raise_for_status(); return response.json()
@@ -183,7 +182,7 @@ async def execute_sell_order(reason="Comando manual"):
     tx_hash = await execute_swap(quote)
     if tx_hash:
         price_info = await fetch_dexscreener_prices(details['pair_address'])
-        exit_price = price_info['price_usd'] if price_info else entry_price # Fallback para entry_price
+        exit_price = price_info['price_usd'] if price_info else entry_price
         profit_percent = ((exit_price - entry_price) / entry_price) * 100
         
         logger.info(f"VENDA EXECUTADA: {details['base_symbol']} @ ${exit_price:.8f}. Lucro/Prejuízo: {profit_percent:.2f}%. TX: {tx_hash}")
@@ -194,15 +193,13 @@ async def execute_sell_order(reason="Comando manual"):
             f"*Preço de Saída:* `${exit_price:.8f}`\n"
             f"*Resultado:* `{profit_percent:.2f}%`", parse_mode='Markdown'
         )
-        # Reseta o estado da posição
         in_position = False
         entry_price = 0.0
         position_high_price = 0.0
 
-# --- LÓGICA CENTRAL SIMPLIFICADA (APENAS MONITORAMENTO DE POSIÇÃO) ---
+# --- Lógica de Monitoramento ---
 async def check_strategy():
     global in_position, entry_price, position_high_price
-    
     if not bot_running or not in_position: return
 
     try:
@@ -210,7 +207,6 @@ async def check_strategy():
         take_profit_percent = parameters["take_profit_percent"]
         trailing_stop_percent = parameters["trailing_stop_percent"]
 
-        # 1. Obter o preço atual
         logger.info(f"Monitorando posição em {details['base_symbol']}. Buscando preço atual...")
         price_data = await fetch_dexscreener_prices(details['pair_address'])
         
@@ -221,18 +217,15 @@ async def check_strategy():
         real_time_price_usd = price_data['price_usd']
         logger.info(f"Preço Atual: ${real_time_price_usd:.8f}")
 
-        # 2. Atualizar o preço máximo da posição (para o trailing stop)
         if real_time_price_usd > position_high_price:
             position_high_price = real_time_price_usd
             logger.info(f"Novo preço máximo da posição: ${position_high_price:.8f}")
 
-        # 3. Calcular alvos
         take_profit_target_usd = entry_price * (1 + take_profit_percent / 100)
         trailing_stop_price_usd = position_high_price * (1 - trailing_stop_percent / 100)
         
         logger.info(f"Posição Aberta: Entrada ${entry_price:.6f}, Máxima ${position_high_price:.6f}, Alvo TP ${take_profit_target_usd:.6f}, Stop Móvel ${trailing_stop_price_usd:.6f}")
 
-        # 4. Verificar se algum alvo foi atingido
         if real_time_price_usd >= take_profit_target_usd:
             await execute_sell_order(reason=f"Take Profit atingido em ${take_profit_target_usd:.6f}")
             return
@@ -267,7 +260,6 @@ async def set_params(update, context):
         await update.effective_message.reply_text("Pare o bot com /stop antes de alterar os parâmetros.")
         return
     try:
-        # Posições: 0:TOKEN, 1:COTAÇÃO, 2:VALOR, 3:TP_%, 4:TS_%
         if len(context.args) != 5:
             await update.effective_message.reply_text("⚠️ *Erro: Formato incorreto.*\nUse: `/set <TOKEN> <COTAÇÃO> <VALOR> <TP_%> <TS_%>`", parse_mode='Markdown')
             return
@@ -282,29 +274,23 @@ async def set_params(update, context):
         
         token_search_url = f"https://api.dexscreener.com/latest/dex/tokens/{base_token_contract}"
         async with httpx.AsyncClient() as client:
-            response = await client.get(token_search_url)
-            response.raise_for_status()
-            token_res = response.json()
+            response = await client.get(token_search_url); response.raise_for_status(); token_res = response.json()
         
         if not token_res.get('pairs'):
-            await update.effective_message.reply_text(f"⚠️ Nenhum par encontrado para este contrato.")
-            return
+            await update.effective_message.reply_text(f"⚠️ Nenhum par encontrado para este contrato."); return
             
         accepted_symbols = [quote_symbol_input]
         if quote_symbol_input == 'SOL': accepted_symbols.append('WSOL')
         
         valid_pairs = [p for p in token_res['pairs'] if p.get('quoteToken', {}).get('symbol') in accepted_symbols]
         if not valid_pairs:
-            await update.effective_message.reply_text(f"⚠️ Nenhum par com `{quote_symbol_input}` encontrado.")
-            return
+            await update.effective_message.reply_text(f"⚠️ Nenhum par com `{quote_symbol_input}` encontrado."); return
         
         trade_pair = max(valid_pairs, key=lambda p: p.get('liquidity', {}).get('usd', 0))
-        base_token_symbol = trade_pair['baseToken']['symbol'].lstrip('$')
-        quote_token_symbol = trade_pair['quoteToken']['symbol']
+        base_token_symbol = trade_pair['baseToken']['symbol'].lstrip('$'); quote_token_symbol = trade_pair['quoteToken']['symbol']
         
         parameters = {
-            "base_token_symbol": base_token_symbol, "quote_token_symbol": quote_token_symbol,
-            "amount": amount,
+            "base_token_symbol": base_token_symbol, "quote_token_symbol": quote_token_symbol, "amount": amount,
             "take_profit_percent": take_profit_percent, "trailing_stop_percent": trailing_stop_percent,
             "trade_pair_details": { 
                 "base_symbol": base_token_symbol, "quote_symbol": quote_token_symbol, 
@@ -314,10 +300,7 @@ async def set_params(update, context):
             }
         }
         
-        # --- BLOCO DE MENSAGEM À PROVA DE FALHAS ---
         logger.info(f"Parâmetros definidos: {parameters}. Tentando enviar confirmação...")
-
-        # Mensagem formatada
         formatted_message = (
             f"✅ *Parâmetros definidos!*\n\n"
             f"🪙 *Par Encontrado:* `{base_token_symbol}/{quote_token_symbol}`\n"
@@ -326,28 +309,24 @@ async def set_params(update, context):
             f"📈 *Take Profit:* `{take_profit_percent}%`\n"
             f"📉 *Trailing Stop:* `{trailing_stop_percent}%`"
         )
-        
         try:
-            # Tenta enviar a mensagem bonita
             await update.effective_message.reply_text(formatted_message, parse_mode='Markdown')
             logger.info("Mensagem de confirmação formatada enviada com sucesso.")
         except Exception as e_msg:
-            # Se falhar, envia uma versão simples
             logger.warning(f"Falha ao enviar mensagem formatada ({e_msg}). Enviando como texto simples.")
             plain_text_message = (
-                f"Parametros definidos!\n\n"
-                f"Par Encontrado: {base_token_symbol}/{quote_token_symbol}\n"
-                f"Endereco do Par: {trade_pair['pairAddress']}\n"
-                f"Valor/Ordem: {amount} {quote_symbol_input}\n"
-                f"Take Profit: {take_profit_percent}%\n"
-                f"Trailing Stop: {trailing_stop_percent}%"
+                f"Parametros definidos!\n\nPar Encontrado: {base_token_symbol}/{quote_token_symbol}\n"
+                f"Endereco do Par: {trade_pair['pairAddress']}\nValor/Ordem: {amount} {quote_symbol_input}\n"
+                f"Take Profit: {take_profit_percent}%\nTrailing Stop: {trailing_stop_percent}%"
             )
             await update.effective_message.reply_text(plain_text_message)
             logger.info("Mensagem de confirmação em texto simples enviada com sucesso.")
             
     except Exception as e: 
         logger.error(f"Erro crítico em set_params: {e}", exc_info=True)
-        await update.effective_message.reply_text(f"⚠️ Erro ao configurar: {e}")async def run_bot(update, context):
+        await update.effective_message.reply_text(f"⚠️ Erro ao configurar: {e}")
+
+async def run_bot(update, context):
     global bot_running, periodic_task
     if not parameters["trade_pair_details"]: await update.effective_message.reply_text("Defina os parâmetros com /set primeiro."); return
     if bot_running: await update.effective_message.reply_text("O bot já está em execução."); return
@@ -364,7 +343,7 @@ async def stop_bot(update, context):
     if not bot_running: await update.effective_message.reply_text("O bot já está parado."); return
     
     bot_running = False
-    in_position = False # Para a verificação ao parar
+    in_position = False
     if periodic_task:
         periodic_task.cancel()
         periodic_task = None
@@ -394,18 +373,16 @@ async def periodic_checker():
                 logger.info("Executando verificação periódica...")
                 await check_strategy()
         except asyncio.CancelledError: 
-            logger.info("Verificador periódico cancelado.")
-            break
+            logger.info("Verificador periódico cancelado."); break
         except Exception as e: 
             logger.error(f"Erro no loop periódico: {e}", exc_info=True)
-            await asyncio.sleep(60) # Espera um pouco mais em caso de erro
+            await asyncio.sleep(60)
 
 def main():
     global application
-    keep_alive() # Inicia o servidor web para o Railway
+    keep_alive()
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     
-    # Adiciona os handlers dos comandos
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("set", set_params))
     application.add_handler(CommandHandler("run", run_bot))
