@@ -27,6 +27,8 @@ app = Flask('')
 def home():
     return "Bot is alive!"
 def run_server():
+  # Adiciona log para saber que o servidor web iniciou
+  logger.info("Iniciando servidor Flask para manter o bot ativo.")
   app.run(host='0.0.0.0',port=8080)
 def keep_alive():
     t = Thread(target=run_server)
@@ -41,23 +43,25 @@ CHAT_ID = os.getenv("CHAT_ID")
 PRIVATE_KEY_B58 = os.getenv("PRIVATE_KEY_BASE58")
 RPC_URL = os.getenv("RPC_URL")
 
-if not all([TELEGRAM_TOKEN, CHAT_ID, PRIVATE_KEY_B58, RPC_URL]):
-    print("Erro: Verifique se todas as variáveis de ambiente estão definidas.")
-    exit()
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', handlers=[logging.StreamHandler()])
+# Configuração do logging para ser mais detalhado
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', handlers=[logging.StreamHandler()])
 logger = logging.getLogger(__name__)
+
+if not all([TELEGRAM_TOKEN, CHAT_ID, PRIVATE_KEY_B58, RPC_URL]):
+    logger.critical("ERRO FATAL: Uma ou mais variáveis de ambiente não estão definidas. Verifique o seu ficheiro .env ou as configurações do Railway.")
+    exit()
 
 # --- CLIENTES PERSISTENTES ---
 solana_client = None
 http_client = None
 
 try:
+    logger.info("Conectando ao RPC da Solana e carregando a carteira...")
     solana_client = Client(RPC_URL)
     payer = Keypair.from_base58_string(PRIVATE_KEY_B58)
     logger.info(f"Carteira carregada com sucesso. Endereço público: {payer.pubkey()}")
 except Exception as e:
-    logger.error(f"Erro ao carregar a carteira Solana: {e}")
+    logger.critical(f"ERRO FATAL ao carregar a carteira Solana: {e}")
     exit()
 
 # --- Variáveis Globais de Estado ---
@@ -78,54 +82,70 @@ parameters = {
 # --- Funções de Execução de Ordem ---
 async def execute_swap(input_mint_str, output_mint_str, amount, input_decimals, slippage_bps=500):
     global http_client
-    logger.info(f"Iniciando swap de {amount} de {input_mint_str} para {output_mint_str}")
+    logger.info(f"--- INICIANDO PROCESSO DE SWAP ---")
+    logger.info(f"De: {amount} {input_mint_str} | Para: {output_mint_str}")
     amount_wei = int(amount * (10**input_decimals))
     
     try:
+        # ETAPA 1: Obter cotação
+        logger.info(f"[SWAP 1/5] Obtendo cotação da API da Jupiter...")
         quote_url = f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint_str}&outputMint={output_mint_str}&amount={amount_wei}&slippageBps={slippage_bps}"
         quote_res = await http_client.get(quote_url)
         quote_res.raise_for_status()
         quote_response = quote_res.json()
+        logger.info("[SWAP 1/5] Cotação recebida com sucesso.")
 
+        # ETAPA 2: Obter transação
+        logger.info("[SWAP 2/5] Solicitando a transação de swap...")
         swap_payload = {
             "userPublicKey": str(payer.pubkey()),
             "quoteResponse": quote_response,
             "wrapAndUnwrapSol": True,
             "prioritizationFee": parameters["priority_fee"]
         }
-        
         swap_url = "https://quote-api.jup.ag/v6/swap"
         swap_res = await http_client.post(swap_url, json=swap_payload)
         swap_res.raise_for_status()
         swap_response = swap_res.json()
         swap_tx_b64 = swap_response.get('swapTransaction')
         if not swap_tx_b64:
-            logger.error(f"Erro na API da Jupiter: {swap_response}"); return None
+            logger.error(f"[ERRO SWAP] A API da Jupiter não retornou uma transação. Resposta: {swap_response}"); return None
+        logger.info("[SWAP 2/5] Transação recebida com sucesso.")
         
+        # ETAPA 3: Assinar a transação
+        logger.info("[SWAP 3/5] Decodificando e assinando a transação com a chave privada...")
         raw_tx_bytes = b64decode(swap_tx_b64)
         swap_tx = VersionedTransaction.from_bytes(raw_tx_bytes)
         signature = payer.sign_message(to_bytes_versioned(swap_tx.message))
         signed_tx = VersionedTransaction.populate(swap_tx.message, [signature])
+        logger.info("[SWAP 3/5] Transação assinada com sucesso.")
 
+        # ETAPA 4: Enviar para a blockchain
+        logger.info("[SWAP 4/5] Enviando a transação para a rede Solana...")
         tx_opts = TxOpts(skip_preflight=False, preflight_commitment="confirmed")
         tx_signature = solana_client.send_raw_transaction(bytes(signed_tx), opts=tx_opts).value
+        logger.info(f"[SWAP 4/5] Transação enviada. Assinatura: {tx_signature}")
         
-        logger.info(f"Transação enviada, aguardando confirmação: {tx_signature}")
+        # ETAPA 5: Confirmar a transação
+        logger.info(f"[SWAP 5/5] Aguardando confirmação final da transação na blockchain...")
         solana_client.confirm_transaction(tx_signature, commitment="confirmed")
-        logger.info(f"Transação confirmada: https://solscan.io/tx/{tx_signature}")
+        logger.info(f"[SWAP 5/5] SUCESSO! Transação confirmada: https://solscan.io/tx/{tx_signature}")
         
         return str(tx_signature)
 
     except Exception as e:
-        logger.error(f"Falha na transação: {e}"); await send_telegram_message(f"⚠️ Falha na transação: {e}"); return None
+        logger.error(f"[ERRO SWAP] Falha crítica durante o processo de swap: {e}", exc_info=True)
+        await send_telegram_message(f"⚠️ Falha na transação: {e}"); return None
 
 async def execute_buy_order(amount, price, reason="Compra Manual"):
     global in_position, entry_price, monitor_task
+    logger.info(f"Recebida ordem de compra para {amount} SOL.")
     if in_position:
+        logger.warning("Compra ignorada: já existe uma posição aberta.")
         await send_telegram_message("⚠️ Já existe uma posição aberta."); return
 
     pair_details = parameters["pair_details"]
-    logger.info(f"EXECUTANDO ORDEM DE COMPRA de {amount} SOL para {pair_details['base_symbol']} ao preço de {price}")
+    logger.info(f"Iniciando processo de compra para {pair_details['base_symbol']} ao preço de {price}")
     
     tx_sig = await execute_swap(pair_details['quote_address'], pair_details['base_address'], amount, 9)
 
@@ -137,33 +157,37 @@ async def execute_buy_order(amount, price, reason="Compra Manual"):
                        f"Entrada: {price:.10f} | Alvo: {price * (1 + parameters['take_profit_percent']/100):.10f} | "
                        f"Stop: {price * (1 - parameters['stop_loss_percent']/100):.10f}\n"
                        f"https://solscan.io/tx/{tx_sig}")
-        logger.info(log_message)
+        logger.info(f"Compra para {pair_details['base_symbol']} bem-sucedida. Iniciando monitoramento de posição.")
         await send_telegram_message(log_message)
 
-        # Inicia a tarefa de monitoramento da posição
         if monitor_task is None or monitor_task.done():
             monitor_task = asyncio.create_task(monitor_position())
     else:
-        logger.error(f"FALHA NA EXECUÇÃO da compra para {pair_details['base_symbol']}.")
+        logger.error(f"FALHA NA EXECUÇÃO da compra para {pair_details['base_symbol']}. A transação não foi confirmada.")
         await send_telegram_message(f"❌ FALHA NA EXECUÇÃO da compra para **{pair_details['base_symbol']}**.")
 
 async def execute_sell_order(reason=""):
     global in_position, entry_price, monitor_task
-    if not in_position: return
+    logger.info(f"Recebida ordem de venda. Motivo: {reason}")
+    if not in_position:
+        logger.warning("Venda ignorada: nenhuma posição aberta.")
+        return
     
     pair_details = parameters["pair_details"]
     symbol = pair_details.get('base_symbol', 'TOKEN')
-    logger.info(f"EXECUTANDO ORDEM DE VENDA de {symbol}. Motivo: {reason}")
+    logger.info(f"Iniciando processo de venda para {symbol}.")
     try:
+        logger.info(f"A obter saldo do token {symbol}...")
         token_mint_pubkey = Pubkey.from_string(pair_details['base_address'])
         ata_address = get_associated_token_address(payer.pubkey(), token_mint_pubkey)
         
         balance_response = solana_client.get_token_account_balance(ata_address)
         token_balance_data = balance_response.value
         amount_to_sell = token_balance_data.ui_amount
+        logger.info(f"Saldo encontrado: {amount_to_sell} {symbol}.")
 
         if amount_to_sell is None or amount_to_sell == 0:
-            logger.warning("Tentativa de venda com saldo zero, resetando posição.")
+            logger.warning("Tentativa de venda com saldo zero. Resetando estado da posição.")
             in_position = False; entry_price = 0.0
             return
 
@@ -173,75 +197,102 @@ async def execute_sell_order(reason=""):
             log_message = (f"🛑 VENDA REALIZADA: {symbol}\n"
                            f"Motivo: {reason}\n"
                            f"https://solscan.io/tx/{tx_sig}")
-            logger.info(log_message)
+            logger.info(f"Venda de {symbol} bem-sucedida. Posição fechada.")
             await send_telegram_message(log_message)
             in_position = False; entry_price = 0.0
             
-            # Para a tarefa de monitoramento
             if monitor_task:
+                logger.info("Cancelando tarefa de monitoramento de posição.")
                 monitor_task.cancel()
                 monitor_task = None
         else:
-            logger.error(f"FALHA NA VENDA do token {symbol}. O bot permanecerá em posição.")
+            logger.error(f"FALHA NA VENDA do token {symbol}. A transação não foi confirmada. O bot permanecerá em posição.")
             await send_telegram_message(f"❌ FALHA NA VENDA do token {symbol}. Use /sell para tentar novamente ou /stop para parar o bot.")
 
     except Exception as e:
-        logger.error(f"Erro crítico ao vender {symbol}: {e}")
+        logger.error(f"Erro crítico durante a execução da venda de {symbol}: {e}", exc_info=True)
         await send_telegram_message(f"⚠️ Erro crítico ao vender {symbol}: {e}")
 
 # --- Funções de Análise e Monitoramento ---
 async def get_pair_details(pair_address, client=None):
-    # Usa o cliente fornecido, ou recorre ao cliente global se nenhum for fornecido.
     http = client if client else http_client
-    url = f"https://api.dexscreener.com/latest/dex/pairs/solana/{pair_address}"
-    try:
-        res = await http.get(url, timeout=10.0)
-        res.raise_for_status()
-        pair_data = res.json().get('pair')
-        if not pair_data: return None
-        return {
-            "pair_address": pair_data['pairAddress'], 
-            "base_symbol": pair_data['baseToken']['symbol'], 
-            "quote_symbol": pair_data['quoteToken']['symbol'], 
-            "base_address": pair_data['baseToken']['address'], 
-            "quote_address": pair_data['quoteToken']['address'],
-            "price_native": float(pair_data.get('priceNative', 0))
-        }
-    except Exception as e:
-        logger.error(f"Erro ao buscar detalhes do par: {e}")
+    if not http:
+        logger.error("Erro fatal: cliente HTTP não está disponível para get_pair_details.")
         return None
+        
+    url = f"https://api.dexscreener.com/latest/dex/pairs/solana/{pair_address}"
+    
+    for attempt in range(3):
+        try:
+            logger.info(f"A buscar detalhes do par {pair_address} na DexScreener (tentativa {attempt + 1}/3)...")
+            res = await http.get(url, timeout=10.0)
+            res.raise_for_status()
+            data = res.json()
+            pair_data = data.get('pair')
+            
+            if not pair_data:
+                logger.warning(f"Endereço {pair_address} não encontrado na DexScreener. A API não retornou o 'par'.")
+                return None
+            
+            logger.info(f"Detalhes de {pair_data['baseToken']['symbol']} obtidos com sucesso.")
+            return {
+                "pair_address": pair_data['pairAddress'], 
+                "base_symbol": pair_data['baseToken']['symbol'], 
+                "quote_symbol": pair_data['quoteToken']['symbol'], 
+                "base_address": pair_data['baseToken']['address'], 
+                "quote_address": pair_data['quoteToken']['address'],
+                "price_native": float(pair_data.get('priceNative', 0))
+            }
+        except httpx.RequestError as e:
+            logger.error(f"Erro de rede ao buscar detalhes do par (tentativa {attempt + 1}/3): {e}")
+            if attempt < 2: await asyncio.sleep(1)
+            else: await send_telegram_message(f"⚠️ Falha de rede ao verificar o contrato {pair_address} após 3 tentativas.")
+        except Exception as e:
+            logger.error(f"Erro inesperado ao processar dados do par: {e}", exc_info=True)
+            return None
+            
+    return None
 
 async def monitor_position():
     global in_position, entry_price
-    logger.info(f"Monitoramento de posição iniciado para {parameters['pair_details']['base_symbol']}.")
+    logger.info(f"--- MONITORAMENTO DE POSIÇÃO INICIADO para {parameters['pair_details']['base_symbol']} ---")
     while in_position and bot_running:
         try:
             latest_details = await get_pair_details(parameters["pair_address"])
             if not latest_details:
+                logger.warning("Não foi possível obter os detalhes do par para o monitoramento. A tentar novamente em 20s.")
                 await asyncio.sleep(20)
                 continue
             
             current_price = latest_details["price_native"]
             profit = ((current_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
-            logger.info(f"Em Posição ({parameters['pair_details']['base_symbol']}): Preço Atual = {current_price:.10f}, P/L = {profit:+.2f}%")
+            logger.info(f"Monitorando {parameters['pair_details']['base_symbol']}: Preço Atual = {current_price:.10f}, P/L = {profit:+.2f}%")
 
             take_profit_price = entry_price * (1 + parameters["take_profit_percent"] / 100)
             stop_loss_price = entry_price * (1 - parameters["stop_loss_percent"] / 100)
-
-            if current_price >= take_profit_price:
-                await execute_sell_order(f"Take Profit (+{parameters['take_profit_percent']}%)")
-            elif current_price <= stop_loss_price:
-                await execute_sell_order(f"Stop Loss (-{parameters['stop_loss_percent']}%)")
             
-            await asyncio.sleep(15) # Verifica a cada 15 segundos
+            logger.info(f"Verificando Stop Loss: {current_price:.10f} <= {stop_loss_price:.10f}?")
+            if current_price <= stop_loss_price:
+                logger.info("CONDIÇÃO DE STOP LOSS ATINGIDA. A iniciar venda.")
+                await execute_sell_order(f"Stop Loss (-{parameters['stop_loss_percent']}%)")
+                continue # Sai do loop após a ordem de venda
+
+            logger.info(f"Verificando Take Profit: {current_price:.10f} >= {take_profit_price:.10f}?")
+            if current_price >= take_profit_price:
+                logger.info("CONDIÇÃO DE TAKE PROFIT ATINGIDA. A iniciar venda.")
+                await execute_sell_order(f"Take Profit (+{parameters['take_profit_percent']}%)")
+                continue # Sai do loop após a ordem de venda
+            
+            await asyncio.sleep(15)
         except asyncio.CancelledError:
-            logger.info("Monitoramento de posição cancelado."); break
+            logger.info("Monitoramento de posição cancelado externamente."); break
         except Exception as e:
-            logger.error(f"Erro no monitoramento de posição: {e}"); await asyncio.sleep(60)
-    logger.info("Monitoramento de posição finalizado.")
+            logger.error(f"Erro crítico no loop de monitoramento: {e}", exc_info=True); await asyncio.sleep(60)
+    logger.info("--- MONITORAMENTO DE POSIÇÃO FINALIZADO ---")
 
 # --- Comandos do Telegram ---
 async def start(update, context):
+    logger.info(f"Comando /start recebido do utilizador {update.effective_user.username}.")
     await update.effective_message.reply_text(
         'Olá! Sou seu bot de operações manuais.\n\n'
         '1. Use `/set <CONTRATO> <STOP_%> <PROFIT_%>` para definir um alvo.\n'
@@ -254,19 +305,23 @@ async def start(update, context):
     )
 
 async def set_params(update, context):
+    logger.info(f"Comando /set recebido com argumentos: {context.args}")
     if bot_running:
+        logger.warning("Tentativa de alterar parâmetros enquanto o bot está em execução.")
         await update.effective_message.reply_text("Pare o bot com `/stop` antes de alterar os parâmetros."); return
     try:
         args = context.args
         pair_address, stop_loss, take_profit = args[0], float(args[1]), float(args[2])
         
-        # Cria um cliente http temporário apenas para esta verificação.
+        logger.info(f"A validar o endereço do contrato: {pair_address}")
         async with httpx.AsyncClient(timeout=10.0) as temp_client:
             pair_details = await get_pair_details(pair_address, client=temp_client)
 
         if not pair_details:
+            logger.error("A validação do contrato falhou.")
             await update.effective_message.reply_text("⚠️ Endereço de contrato inválido ou não encontrado."); return
-
+        
+        logger.info(f"Contrato validado com sucesso. Símbolo: {pair_details['base_symbol']}")
         parameters.update(
             pair_address=pair_address,
             pair_details=pair_details,
@@ -282,6 +337,7 @@ async def set_params(update, context):
             parse_mode='Markdown'
         )
     except (IndexError, ValueError):
+        logger.warning(f"Comando /set com formato incorreto: {context.args}")
         await update.effective_message.reply_text(
             "⚠️ *Formato incorreto.*\n"
             "Use: `/set <CONTRATO> <STOP_%> <PROFIT_%>`\n"
@@ -291,70 +347,92 @@ async def set_params(update, context):
 
 async def run_bot(update, context):
     global bot_running, http_client
+    logger.info("Comando /run recebido.")
     if bot_running:
+        logger.warning("Comando /run ignorado, bot já em execução.")
         await update.effective_message.reply_text("O bot já está em execução."); return
     
+    logger.info("Iniciando o cliente de rede principal (httpx)...")
     http_client = httpx.AsyncClient(timeout=30.0)
     bot_running = True
-    logger.info("Bot iniciado em modo manual.")
-    await update.effective_message.reply_text("🚀 Bot iniciado! Use `/set` para definir um alvo e `/buy` para comprar.")
+    logger.info("Bot alterado para o estado 'em execução'.")
+    await update.effective_message.reply_text("🚀 Bot iniciado! Pronto para receber comandos.")
 
 async def stop_bot(update, context):
     global bot_running, monitor_task, http_client
+    logger.info("Comando /stop recebido.")
     if not bot_running:
+        logger.warning("Comando /stop ignorado, bot já parado.")
         await update.effective_message.reply_text("O bot já está parado."); return
     
     await update.effective_message.reply_text("Parando o bot...")
     bot_running = False
-    if monitor_task:
+    logger.info("Bot alterado para o estado 'parado'.")
+    
+    if monitor_task and not monitor_task.done():
+        logger.info("A cancelar a tarefa de monitoramento de posição...")
         monitor_task.cancel()
         monitor_task = None
     
     if in_position:
+        logger.info("Posição aberta encontrada. A iniciar venda de emergência...")
         await execute_sell_order("Parada manual do bot")
     
     if http_client:
+        logger.info("A fechar o cliente de rede principal (httpx)...")
         await http_client.aclose()
         http_client = None
     
-    logger.info("Bot de trade parado.")
+    logger.info("Processo de paragem concluído.")
     await update.effective_message.reply_text("🛑 Bot parado. Posição (se existente) foi vendida.")
 
 async def manual_buy(update, context):
+    logger.info(f"Comando /buy recebido com argumentos: {context.args}")
     if not bot_running:
+        logger.warning("Comando /buy ignorado, bot não está em execução.")
         await update.effective_message.reply_text("⚠️ O bot precisa estar em execução. Use `/run` primeiro."); return
     if in_position:
+        logger.warning("Comando /buy ignorado, já existe uma posição aberta.")
         await update.effective_message.reply_text("⚠️ Já existe uma posição aberta."); return
     if not parameters.get("pair_address"):
+        logger.warning("Comando /buy ignorado, nenhum alvo definido.")
         await update.effective_message.reply_text("⚠️ Nenhum alvo definido. Use `/set` primeiro."); return
         
     try:
         amount = float(context.args[0])
         if amount <= 0:
+            logger.warning(f"Valor de compra inválido: {amount}")
             await update.effective_message.reply_text("⚠️ O valor deve ser positivo."); return
 
         pair_details = parameters["pair_details"]
+        logger.info(f"A obter preço atual para a compra manual de {pair_details['base_symbol']}...")
         latest_details = await get_pair_details(pair_details['pair_address'])
         if not latest_details:
+            logger.error("Não foi possível obter o preço atual para a compra.")
             await update.effective_message.reply_text("⚠️ Não foi possível obter o preço atual do alvo."); return
         
         current_price = latest_details['price_native']
+        logger.info(f"Preço atual obtido: {current_price}. A iniciar a execução da compra.")
         
         await update.effective_message.reply_text(f"Iniciando compra de {amount} SOL em {pair_details['base_symbol']}...")
         await execute_buy_order(amount, current_price)
 
     except (IndexError, ValueError):
+        logger.warning(f"Comando /buy com formato incorreto: {context.args}")
         await update.effective_message.reply_text("⚠️ *Formato incorreto.*\nUse: `/buy <VALOR>`\nEx: `/buy 0.1`", parse_mode='Markdown')
     except Exception as e:
-        logger.error(f"Erro no comando /buy: {e}"); await update.effective_message.reply_text(f"⚠️ Erro ao executar compra: {e}")
+        logger.error(f"Erro inesperado no comando /buy: {e}", exc_info=True); await update.effective_message.reply_text(f"⚠️ Erro ao executar compra: {e}")
 
 async def manual_sell(update, context):
+    logger.info("Comando /sell recebido.")
     if not in_position:
+        logger.warning("Comando /sell ignorado, nenhuma posição aberta.")
         await update.effective_message.reply_text("⚠️ Nenhuma posição aberta para vender."); return
     await update.effective_message.reply_text("Forçando venda manual da posição atual...")
     await execute_sell_order(reason="Venda Manual Forçada")
 
 async def status(update, context):
+    logger.info("Comando /status recebido.")
     if not bot_running:
         await update.effective_message.reply_text("O bot está parado."); return
 
@@ -362,6 +440,7 @@ async def status(update, context):
         pair_details = parameters["pair_details"]
         symbol = pair_details['base_symbol']
         
+        logger.info(f"A obter preço atual para o status de {symbol}...")
         latest_details = await get_pair_details(parameters["pair_address"])
         current_price = latest_details["price_native"] if latest_details else entry_price
         
@@ -392,9 +471,12 @@ async def send_telegram_message(message):
 
 def main():
     global application
+    logger.info("--- INICIANDO O BOT ---")
     keep_alive()
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
+    # Adicionando os handlers dos comandos
+    logger.info("Configurando os handlers dos comandos do Telegram...")
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("set", set_params))
     application.add_handler(CommandHandler("run", run_bot))
@@ -403,7 +485,7 @@ def main():
     application.add_handler(CommandHandler("sell", manual_sell))
     application.add_handler(CommandHandler("status", status))
     
-    logger.info("Bot do Telegram iniciado e aguardando comandos...")
+    logger.info("Bot do Telegram pronto. A iniciar o polling...")
     application.run_polling()
 
 if __name__ == '__main__':
