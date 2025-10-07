@@ -74,19 +74,22 @@ parameters = {
 # --- FUNÇÕES NÚCLEO (MANTIDAS DO SEU BOT ORIGINAL) ---
 
 async def execute_swap(input_mint_str, output_mint_str, amount, input_decimals):
-    """Executa a troca usando a API da Jupiter com lógica de retry."""
+    """Executa a troca usando a API da Jupiter com lógica de retry e logging detalhado."""
     logger.info(f"Iniciando swap de {amount} de {input_mint_str} para {output_mint_str}")
     amount_wei = int(amount * (10**input_decimals))
     
-    async with httpx.AsyncClient() as client:
-        try:
-            # 1. Obter a cotação (quote)
+    try:
+        async with httpx.AsyncClient() as client:
+            # ETAPA 1: Obter a cotação (quote) da Jupiter
+            logger.info("ETAPA 1/4: Obtendo cotação da API da Jupiter...")
             quote_url = f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint_str}&outputMint={output_mint_str}&amount={amount_wei}&slippageBps={parameters['slippage_bps']}&maxAccounts=64"
             quote_res = await client.get(quote_url, timeout=60.0)
             quote_res.raise_for_status()
             quote_response = quote_res.json()
+            logger.info("Cotação da Jupiter obtida com sucesso.")
 
-            # 2. Criar a transação de swap
+            # ETAPA 2: Criar a transação de swap
+            logger.info("ETAPA 2/4: Criando payload da transação com a API da Jupiter...")
             swap_payload = { 
                 "userPublicKey": str(payer.pubkey()), 
                 "quoteResponse": quote_response, 
@@ -99,46 +102,56 @@ async def execute_swap(input_mint_str, output_mint_str, amount, input_decimals):
             swap_res.raise_for_status()
             swap_tx_b64 = swap_res.json().get('swapTransaction')
             if not swap_tx_b64:
-                logger.error(f"Erro na API da Jupiter: {swap_res.json()}"); return None
-            
-            # 3. Assinar e preparar a transação
-            raw_tx_bytes = b64decode(swap_tx_b64)
-            swap_tx = VersionedTransaction.from_bytes(raw_tx_bytes)
-            signature = payer.sign_message(to_bytes_versioned(swap_tx.message))
-            signed_tx = VersionedTransaction.populate(swap_tx.message, [signature])
+                logger.error(f"Erro na API da Jupiter ao criar swap: {swap_res.json()}"); return None
+            logger.info("Payload da transação obtido com sucesso.")
+        
+        # ETAPA 3: Assinar e preparar a transação
+        logger.info("ETAPA 3/4: Assinando a transação localmente...")
+        raw_tx_bytes = b64decode(swap_tx_b64)
+        swap_tx = VersionedTransaction.from_bytes(raw_tx_bytes)
+        signature = payer.sign_message(to_bytes_versioned(swap_tx.message))
+        signed_tx = VersionedTransaction.populate(swap_tx.message, [signature])
+        logger.info("Transação assinada com sucesso.")
 
-            # 4. Enviar e confirmar transação com LÓGICA DE RETRY
-            max_retries = 3
-            tx_signature = None
-            for attempt in range(max_retries):
-                try:
-                    logger.info(f"Enviando transação (tentativa {attempt + 1}/{max_retries})...")
-                    tx_opts = TxOpts(skip_preflight=True)
-                    tx_signature = solana_client.send_raw_transaction(bytes(signed_tx), opts=tx_opts).value
-                    
-                    logger.info(f"Transação enviada, aguardando confirmação: {tx_signature}")
-                    solana_client.confirm_transaction(tx_signature, commitment="confirmed")
-                    logger.info(f"Transação confirmada com sucesso na tentativa {attempt + 1}.")
-                    break  # Sai do loop se for bem-sucedido
+        # ETAPA 4: Enviar e confirmar transação com LÓGICA DE RETRY
+        logger.info("ETAPA 4/4: Enviando transação para a rede Solana...")
+        max_retries = 3
+        tx_signature = None
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"Enviando transação (tentativa {attempt + 1}/{max_retries})...")
+                tx_opts = TxOpts(skip_preflight=True)
+                tx_signature = solana_client.send_raw_transaction(bytes(signed_tx), opts=tx_opts).value
+                
+                logger.info(f"Transação enviada, aguardando confirmação: {tx_signature}")
+                solana_client.confirm_transaction(tx_signature, commitment="confirmed")
+                logger.info(f"Transação confirmada com sucesso na tentativa {attempt + 1}.")
+                break  # Sai do loop se for bem-sucedido
 
-                except OSError as e:
-                    if "[Errno -5]" in str(e) and attempt < max_retries - 1:
-                        logger.warning(f"Erro de rede [Errno -5] na tentativa {attempt + 1}. Tentando novamente em 2 segundos...")
-                        await asyncio.sleep(2)
-                    else:
-                        raise e # Lança o erro se todas as tentativas falharem
-                except Exception:
-                    raise # Lança outros erros imediatamente
-            
-            if not tx_signature:
-                logger.error("Não foi possível confirmar a transação após todas as tentativas.")
-                return None
+            except OSError as e:
+                if "[Errno -5]" in str(e) and attempt < max_retries - 1:
+                    logger.warning(f"Erro de rede [Errno -5] ao enviar para a Solana na tentativa {attempt + 1}. Tentando novamente em 2 segundos...")
+                    await asyncio.sleep(2)
+                else:
+                    logger.error(f"Erro de rede [Errno -5] persistente ao enviar para a Solana.")
+                    raise e # Lança o erro se todas as tentativas falharem
+            except Exception as e:
+                logger.error(f"Erro inesperado ao enviar/confirmar transação na Solana: {e}")
+                raise # Lança outros erros imediatamente
+        
+        if not tx_signature:
+            logger.error("Não foi possível confirmar a transação na Solana após todas as tentativas.")
+            return None
 
-            logger.info(f"Transação final confirmada: https://solscan.io/tx/{tx_signature}")
-            return str(tx_signature)
+        logger.info(f"Transação final confirmada: https://solscan.io/tx/{tx_signature}")
+        return str(tx_signature)
 
-        except Exception as e:
-            logger.error(f"Falha no swap: {e}"); await send_telegram_message(f"⚠️ Falha no swap: {e}"); return None
+    except OSError as e:
+        if "[Errno -5]" in str(e):
+            logger.critical(f"FALHA CRÍTICA DE REDE [Errno -5] durante o swap. Verifique o ambiente do container/Dockerfile.")
+        await send_telegram_message(f"⚠️ Falha no swap (Erro de Rede): {e}"); return None
+    except Exception as e:
+        logger.error(f"Falha no swap: {e}"); await send_telegram_message(f"⚠️ Falha no swap: {e}"); return None
 
 async def fetch_dexscreener_real_time_price(pair_address):
     """Busca o preço atual de um par na DexScreener."""
