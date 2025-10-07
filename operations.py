@@ -80,6 +80,15 @@ async def execute_swap(input_mint_str, output_mint_str, amount, input_decimals):
     
     try:
         async with httpx.AsyncClient() as client:
+            # ETAPA 0: Teste de conectividade de rede
+            try:
+                logger.info("ETAPA 0/4: Testando conectividade de rede geral...")
+                await client.get("https://www.google.com", timeout=10.0)
+                logger.info("Conectividade de rede OK.")
+            except Exception as net_err:
+                logger.critical(f"FALHA NO TESTE DE REDE: Não foi possível acessar a internet. Erro: {net_err}")
+                raise net_err # Interrompe a execução se não houver internet
+
             # ETAPA 1: Obter a cotação (quote) da Jupiter
             logger.info("ETAPA 1/4: Obtendo cotação da API da Jupiter...")
             quote_url = f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint_str}&outputMint={output_mint_str}&amount={amount_wei}&slippageBps={parameters['slippage_bps']}&maxAccounts=64"
