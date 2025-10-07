@@ -41,6 +41,25 @@ CHAT_ID = os.getenv("CHAT_ID")
 PRIVATE_KEY_B58 = os.getenv("PRIVATE_KEY_BASE58")
 RPC_URL = os.getenv("RPC_URL")
 
+# --- Bloco de Debug ---
+import os
+import sys
+
+print("--- INICIANDO VERIFICACAO DE VARIAVEIS DE AMBIENTE ---")
+rpc_url_recebida = os.getenv("RPC_URL")
+print(f"--- DEBUG: Valor recebido para RPC_URL: '{rpc_url_recebida}' ---")
+
+if not rpc_url_recebida:
+    print("--- ERRO FATAL: Variavel de ambiente 'RPC_URL' NAO ENCONTRADA ou VAZIA. Verifique o painel do Railway. ---")
+    sys.exit(1) # Para a execução imediatamente
+else:
+    print("--- SUCESSO: Variavel 'RPC_URL' carregada. Continuando... ---")
+# --- Fim do Bloco de Debug ---
+
+# O resto do seu código continua aqui
+# TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+# ...
+
 if not all([TELEGRAM_TOKEN, CHAT_ID, PRIVATE_KEY_B58, RPC_URL]):
     print("Erro: Verifique se todas as variáveis de ambiente (.env) estão definidas.")
     exit()
