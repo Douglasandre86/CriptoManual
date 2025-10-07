@@ -41,25 +41,6 @@ CHAT_ID = os.getenv("CHAT_ID")
 PRIVATE_KEY_B58 = os.getenv("PRIVATE_KEY_BASE58")
 RPC_URL = os.getenv("RPC_URL")
 
-# --- Bloco de Debug ---
-import os
-import sys
-
-print("--- INICIANDO VERIFICACAO DE VARIAVEIS DE AMBIENTE ---")
-rpc_url_recebida = os.getenv("RPC_URL")
-print(f"--- DEBUG: Valor recebido para RPC_URL: '{rpc_url_recebida}' ---")
-
-if not rpc_url_recebida:
-    print("--- ERRO FATAL: Variavel de ambiente 'RPC_URL' NAO ENCONTRADA ou VAZIA. Verifique o painel do Railway. ---")
-    sys.exit(1) # Para a execução imediatamente
-else:
-    print("--- SUCESSO: Variavel 'RPC_URL' carregada. Continuando... ---")
-# --- Fim do Bloco de Debug ---
-
-# O resto do seu código continua aqui
-# TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-# ...
-
 if not all([TELEGRAM_TOKEN, CHAT_ID, PRIVATE_KEY_B58, RPC_URL]):
     print("Erro: Verifique se todas as variáveis de ambiente (.env) estão definidas.")
     exit()
@@ -93,7 +74,7 @@ parameters = {
 # --- FUNÇÕES NÚCLEO (MANTIDAS DO SEU BOT ORIGINAL) ---
 
 async def execute_swap(input_mint_str, output_mint_str, amount, input_decimals):
-    """Executa a troca usando a API da Jupiter. Reutilizada do seu bot."""
+    """Executa a troca usando a API da Jupiter com lógica de retry."""
     logger.info(f"Iniciando swap de {amount} de {input_mint_str} para {output_mint_str}")
     amount_wei = int(amount * (10**input_decimals))
     
@@ -120,17 +101,40 @@ async def execute_swap(input_mint_str, output_mint_str, amount, input_decimals):
             if not swap_tx_b64:
                 logger.error(f"Erro na API da Jupiter: {swap_res.json()}"); return None
             
-            # 3. Assinar e enviar a transação
+            # 3. Assinar e preparar a transação
             raw_tx_bytes = b64decode(swap_tx_b64)
             swap_tx = VersionedTransaction.from_bytes(raw_tx_bytes)
             signature = payer.sign_message(to_bytes_versioned(swap_tx.message))
             signed_tx = VersionedTransaction.populate(swap_tx.message, [signature])
-            tx_opts = TxOpts(skip_preflight=True)
-            tx_signature = solana_client.send_raw_transaction(bytes(signed_tx), opts=tx_opts).value
+
+            # 4. Enviar e confirmar transação com LÓGICA DE RETRY
+            max_retries = 3
+            tx_signature = None
+            for attempt in range(max_retries):
+                try:
+                    logger.info(f"Enviando transação (tentativa {attempt + 1}/{max_retries})...")
+                    tx_opts = TxOpts(skip_preflight=True)
+                    tx_signature = solana_client.send_raw_transaction(bytes(signed_tx), opts=tx_opts).value
+                    
+                    logger.info(f"Transação enviada, aguardando confirmação: {tx_signature}")
+                    solana_client.confirm_transaction(tx_signature, commitment="confirmed")
+                    logger.info(f"Transação confirmada com sucesso na tentativa {attempt + 1}.")
+                    break  # Sai do loop se for bem-sucedido
+
+                except OSError as e:
+                    if "[Errno -5]" in str(e) and attempt < max_retries - 1:
+                        logger.warning(f"Erro de rede [Errno -5] na tentativa {attempt + 1}. Tentando novamente em 2 segundos...")
+                        await asyncio.sleep(2)
+                    else:
+                        raise e # Lança o erro se todas as tentativas falharem
+                except Exception:
+                    raise # Lança outros erros imediatamente
             
-            logger.info(f"Transação enviada, aguardando confirmação: {tx_signature}")
-            solana_client.confirm_transaction(tx_signature, commitment="confirmed")
-            logger.info(f"Transação confirmada: https://solscan.io/tx/{tx_signature}")
+            if not tx_signature:
+                logger.error("Não foi possível confirmar a transação após todas as tentativas.")
+                return None
+
+            logger.info(f"Transação final confirmada: https://solscan.io/tx/{tx_signature}")
             return str(tx_signature)
 
         except Exception as e:
@@ -378,3 +382,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
