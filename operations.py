@@ -78,28 +78,33 @@ parameters = {
     "priority_fee": 2000000
 }
 
-# --- FUNÇÃO DE RESOLUÇÃO DE DNS MANUAL ---
+# --- FUNÇÃO DE RESOLUÇÃO DE DNS MANUAL (USANDO GOOGLE) ---
 async def resolve_ip_with_doh(hostname):
-    """Resolve o IP de um hostname usando a API DNS-over-HTTPS da Cloudflare."""
-    logger.info(f"Resolvendo o IP para {hostname} usando DNS-over-HTTPS...")
+    """Resolve o IP de um hostname usando a API DNS-over-HTTPS da Google."""
+    logger.info(f"Resolvendo o IP para {hostname} usando DNS-over-HTTPS da Google...")
     try:
         async with httpx.AsyncClient() as client:
             response = await client.get(
-                "https://cloudflare-dns.com/dns-query",
-                headers={"accept": "application/dns-json"},
+                "https://dns.google/resolve",
                 params={"name": hostname, "type": "A"},
             )
             response.raise_for_status()
             data = response.json()
+            # A API da Google retorna 'Answer' mesmo em caso de falha, então verificamos o status primeiro
             if data.get("Status") == 0 and "Answer" in data:
-                ip_address = data["Answer"][0]["data"]
-                logger.info(f"IP para {hostname} resolvido com sucesso: {ip_address}")
-                return ip_address
+                # Procura pelo primeiro registo do tipo 'A'
+                for answer in data["Answer"]:
+                    if answer.get("type") == 1: # Tipo 1 é um registo A (endereço IPv4)
+                        ip_address = answer["data"]
+                        logger.info(f"IP para {hostname} resolvido com sucesso: {ip_address}")
+                        return ip_address
+                logger.error(f"A API DoH da Google não retornou um registo 'A' para {hostname}. Resposta: {data}")
+                return None
             else:
-                logger.error(f"A API DoH não conseguiu resolver o IP para {hostname}. Resposta: {data}")
+                logger.error(f"A API DoH da Google não conseguiu resolver o IP para {hostname}. Resposta: {data}")
                 return None
     except Exception as e:
-        logger.error(f"Falha ao resolver o IP para {hostname} via DoH: {e}")
+        logger.error(f"Falha ao resolver o IP para {hostname} via DoH da Google: {e}")
         return None
 
 # --- Funções de Execução de Ordem ---
