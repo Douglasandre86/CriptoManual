@@ -4,7 +4,6 @@ python-telegram-bot
 pandas>=2.2.0
 pandas-ta
 httpx
-doh-httpx
 python-dotenv
 solders==0.18.0
 solana==0.30.2
