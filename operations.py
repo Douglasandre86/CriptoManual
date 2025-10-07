@@ -190,11 +190,12 @@ async def execute_sell_order(reason=""):
         await send_telegram_message(f"⚠️ Erro crítico ao vender {symbol}: {e}")
 
 # --- Funções de Análise e Monitoramento ---
-async def get_pair_details(pair_address):
-    global http_client
+async def get_pair_details(pair_address, client=None):
+    # Usa o cliente fornecido, ou recorre ao cliente global se nenhum for fornecido.
+    http = client if client else http_client
     url = f"https://api.dexscreener.com/latest/dex/pairs/solana/{pair_address}"
     try:
-        res = await http_client.get(url, timeout=10.0)
+        res = await http.get(url, timeout=10.0)
         res.raise_for_status()
         pair_data = res.json().get('pair')
         if not pair_data: return None
@@ -259,12 +260,9 @@ async def set_params(update, context):
         args = context.args
         pair_address, stop_loss, take_profit = args[0], float(args[1]), float(args[2])
         
-        # O http_client precisa estar ativo para esta verificação
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            global http_client
-            temp_client, http_client = http_client, client
-            pair_details = await get_pair_details(pair_address)
-            http_client = temp_client
+        # Cria um cliente http temporário apenas para esta verificação.
+        async with httpx.AsyncClient(timeout=10.0) as temp_client:
+            pair_details = await get_pair_details(pair_address, client=temp_client)
 
         if not pair_details:
             await update.effective_message.reply_text("⚠️ Endereço de contrato inválido ou não encontrado."); return
