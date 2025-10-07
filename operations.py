@@ -9,7 +9,7 @@ import asyncio
 from base64 import b64decode
 import httpx
 # --- NOVA IMPORTAÇÃO PARA DNS-OVER-HTTPS ---
-from httpx_doh import DOHTransport
+from httpx_dns import AsyncDNSoverHTTPS
 
 # --- Libs da Solana ---
 from solders.pubkey import Pubkey
