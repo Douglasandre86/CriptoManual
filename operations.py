@@ -568,7 +568,7 @@ async def autonomous_loop():
     target_token_address = parameters.get("target_token_address")
     if not target_token_address:
         logger.error("Endereço do token alvo não definido. Use /set para configurar.")
-        await send_telegram_message("❌ Loop autônomo não iniciado: Endereço do token alvo não definido. Use `/set <ENDERECO_TOKEN> <VALOR_SOL> <STOP_LOSS_%> <TAKE_PROFIT_%> [PRIORITY_FEE]` para configurar.")
+        await send_telegram_message("❌ Loop autônomo não iniciado: Endereço do token alvo não definido. Use `/set <ENDERECO_TOKEN> <STOP_LOSS_%> <TAKE_PROFIT_%> [PRIORITY_FEE]` para configurar.")
         automation_state["is_running"] = False
         return
 
@@ -618,7 +618,7 @@ async def autonomous_loop():
 # ---------------- Comandos Telegram ----------------
 async def start(update, context):
     await update.effective_message.reply_text(
-        'Olá! Bot sniper iniciado em modo manual.\nUse `/set <ENDERECO_TOKEN> <STOP_LOSS_%> <TAKE_PROFIT_%> [PRIORITY_FEE]` para definir o token e parâmetros. Use `/run` para iniciar o monitoramento da posição (após a compra inicial com /buy). Use `/buy <VALOR_SOL>` para comprar ou `/sell` para vender.',
+        'Olá! Bot sniper iniciado em modo manual.\nUse `/set <ENDERECO_TOKEN> <STOP_LOSS_%> <TAKE_PROFIT_%> [PRIORITY_FEE]` para definir o token e parâmetros. Use `/run` para iniciar o monitoramento. Use `/buy <VALOR_SOL>` para comprar ou `/sell` para vender.',
         parse_mode='Markdown'
     )
 
@@ -674,11 +674,10 @@ async def set_params(update, context):
         await update.effective_message.reply_text(
             f"✅ Parâmetros definidos para o modo manual:\n"
             f"Token Alvo: `{target_token_address}`\n"
-            # Removed Valor de Compra Inicial display
             f"Stop Loss: {stop_loss}%\n"
             f"Take Profit: {take_profit}%\n"
             f"Priority Fee: {priority_fee}\n\n"
-            "Use `/buy <VALOR_SOL>` para realizar a primeira compra e `/run` para iniciar o monitoramento de TP/SL.",
+            "Use `/run` para iniciar o monitoramento e `/buy <VALOR_SOL>` para realizar a compra.",
             parse_mode='Markdown'
         )
 
@@ -716,11 +715,7 @@ async def run_bot(update, context):
          automation_state["target_selected_timestamp"] = time.time() # Set timestamp when target is confirmed
 
 
-    # Check if in_position is True. If not, inform the user to use /buy first.
-    if not in_position:
-        await update.effective_message.reply_text("⚠️ Nenhuma posição aberta. Use `/buy <VALOR_SOL>` para comprar antes de iniciar o monitoramento de TP/SL.", parse_mode='Markdown')
-        return
-
+    # Removed the check if in_position is True. The loop will now start even without a position.
 
     automation_state["is_running"] = True
     automation_state["task"] = asyncio.create_task(autonomous_loop())
@@ -728,8 +723,8 @@ async def run_bot(update, context):
     logger.info("Bot de trade autônomo iniciado.")
     await send_telegram_message(
         "🚀 Bot de trade autônomo iniciado em modo manual!\n"
-        f"Monitorando a posição aberta no token alvo: `{automation_state.get('current_target_token_address', 'N/A')}`\n"
-        "O bot irá gerenciar Take Profit e Stop Loss automaticamente. Use os comandos `/buy <VALOR_SOL>` para compras adicionais ou `/sell` para vender manualmente."
+        f"Monitorando o token alvo: `{automation_state.get('current_target_token_address', 'N/A')}`\n"
+        "Use o comando `/buy <VALOR_SOL>` para realizar a compra. Se houver uma posição aberta, o bot gerenciará Take Profit e Stop Loss automaticamente. Use `/sell` para vender manualmente."
     )
 
 async def stop_bot(update, context):
@@ -768,7 +763,8 @@ async def stop_bot(update, context):
     )
     # Also reset parameters related to the target token
     parameters.update(
-        target_token_address=None
+        target_token_address=None,
+        amount=None # Ensure amount is also reset
     )
 
 
