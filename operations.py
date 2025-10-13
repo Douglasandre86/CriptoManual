@@ -103,7 +103,7 @@ automation_state = {
 
 parameters = {
     "timeframe": "1m",
-    "amount": None,                 # em SOL
+    "amount": None,                 # em SOL - This will now only be used by /buy
     "stop_loss_percent": None,      # ex: 15
     "take_profit_percent": None,    # ex: 20
     "priority_fee": 2000000,
@@ -290,45 +290,35 @@ async def execute_buy_order(amount, price, pair_details, manual=False, reason="S
     global in_position, entry_price, sell_fail_count, buy_fail_count
 
     if in_position:
-        logger.info("Já em posição, abortando compra.")
-        return
+        # In manual mode, allow adding to position via /buy
+        logger.info("Já em posição, executando compra adicional.")
+        # For simplicity, we don't update entry_price for add-on buys.
+        # A more complex bot would calculate an average entry price.
+    else:
+        logger.info("Iniciando primeira ordem de compra.")
 
-    if not manual:
-        logger.info(f"Verificação final de cotação para {pair_details['baseToken']['symbol']} antes da compra...")
-        # Add retry logic for Jupiter quotability check
-        retries = 3
-        is_quotable = False
-        for attempt in range(retries):
-            if await is_pair_quotable_on_jupiter(pair_details):
-                is_quotable = True
-                break
-            logger.warning(f"Par {pair_details['baseToken']['symbol']} não quotable na Jupiter. Tentativa {attempt + 1}/{retries}. Aguardando 5 segundos...")
-            await asyncio.sleep(5)
 
-        if not is_quotable:
-            logger.error(f"FALHA NA COMPRA: Par {pair_details['baseToken']['symbol']} não se tornou negociável na Jupiter após {retries} tentativas.")
-            await send_telegram_message(f"❌ Compra para **{pair_details['baseToken']['symbol']}** abortada. Moeda não negociável na Jupiter após várias tentativas.")
-            return
+    logger.info(f"Iniciando swap de {amount} SOL para {pair_details['baseToken']['symbol']} ao preço de {price}")
 
-    # Calculate slippage and get volatility
+    # Calculate slippage based on volatility (kept as per user request)
     slippage_bps, volatility = await calculate_dynamic_slippage(pair_details['pairAddress'])
 
-
-    logger.info(f"EXECUTANDO ORDEM DE COMPRA de {amount} SOL para {pair_details['baseToken']['symbol']} ao preço de {price}")
 
     # Assuming quoteToken is always SOL and baseToken is the target token
     tx_sig = await execute_swap("So11111111111111111111111111111111111111112", pair_details['baseToken']['address'], amount, 9, slippage_bps)
 
     if tx_sig:
-        in_position = True
-        entry_price = price # Set entry_price on successful buy (in USD)
-        automation_state["position_opened_timestamp"] = time.time()
+        if not in_position: # Only set entry price and timestamp for the first buy
+            in_position = True
+            entry_price = price # Set entry_price on successful buy (in USD)
+            automation_state["position_opened_timestamp"] = time.time()
+
         sell_fail_count = 0
         buy_fail_count = 0
         log_message = (f"✅ COMPRA REALIZADA: {amount} SOL para {pair_details['baseToken']['symbol']}\n"
                        f"Motivo: {reason}\n"
-                       f"Entrada (USD): ${price:.10f} | Alvo (USD): ${price * (1 + parameters['take_profit_percent']/100):.10f} | "
-                       f"Stop (USD): ${price * (1 - parameters['stop_loss_percent']/100):.10f}\n"
+                       f"Entrada (USD): ${entry_price:.10f} | Alvo (USD): ${entry_price * (1 + parameters['take_profit_percent']/100):.10f} | "
+                       f"Stop (USD): ${entry_price * (1 - parameters['stop_loss_percent']/100):.10f}\n"
                        f"Slippage Usado: {slippage_bps/100:.2f}%\n"
                        f"Taxa de Prioridade: {parameters.get('priority_fee')} micro-lamports\n"
                        f"https://solscan.io/tx/{tx_sig}")
@@ -603,7 +593,7 @@ async def autonomous_loop():
     while automation_state.get("is_running", False):
         try:
             # ------------------------------------------------------------------
-            # ESTADO 2 & 3: MONITORAMENTO E GERENCIAMENTO (Alvo selecionado, aguardando para comprar ou em posição)
+            # ESTADO: MONITORAMENTO E GERENCIAMENTO (Alvo selecionado, aguardando para comprar ou em posição)
             # ------------------------------------------------------------------
             # In manual mode, we only manage the position if we are in one.
             # Manual buy is done via command.
@@ -628,24 +618,27 @@ async def autonomous_loop():
 # ---------------- Comandos Telegram ----------------
 async def start(update, context):
     await update.effective_message.reply_text(
-        'Olá! Bot sniper iniciado em modo manual.\nUse `/set <ENDERECO_TOKEN> <VALOR_SOL> <STOP_LOSS_%> <TAKE_PROFIT_%> [PRIORITY_FEE]` para definir o token e parâmetros, e depois `/run` para iniciar o monitoramento.',
+        'Olá! Bot sniper iniciado em modo manual.\nUse `/set <ENDERECO_TOKEN> <STOP_LOSS_%> <TAKE_PROFIT_%> [PRIORITY_FEE]` para definir o token e parâmetros. Use `/run` para iniciar o monitoramento da posição (após a compra inicial com /buy). Use `/buy <VALOR_SOL>` para comprar ou `/sell` para vender.',
         parse_mode='Markdown'
     )
 
 async def set_params(update, context):
-    if automation_state.get("is_running", False): # Use the correct state variable
+    global automation_state # Removed in_position and entry_price from global
+
+    if automation_state.get("is_running", False):
         await update.effective_message.reply_text("Pare o bot com /stop antes de alterar os parâmetros."); return
     try:
         args = context.args
-        if len(args) < 4:
-             await update.effective_message.reply_text("⚠️ Formato incorreto. Uso: `/set <ENDERECO_TOKEN> <VALOR_SOL> <STOP_LOSS_%> <TAKE_PROFIT_%> [PRIORITY_FEE]`", parse_mode='Markdown')
+        # Adjusted expected number of arguments
+        if len(args) < 3:
+             await update.effective_message.reply_text("⚠️ Formato incorreto. Uso: `/set <ENDERECO_TOKEN> <STOP_LOSS_%> <TAKE_PROFIT_%> [PRIORITY_FEE]`", parse_mode='Markdown')
              return
 
         target_token_address = args[0]
-        amount = float(args[1])
-        stop_loss = float(args[2])
-        take_profit = float(args[3])
-        priority_fee = int(args[4]) if len(args) > 4 else 2000000 # Default priority fee
+        # Removed amount from here
+        stop_loss = float(args[1])
+        take_profit = float(args[2])
+        priority_fee = int(args[3]) if len(args) > 3 else 2000000 # Adjusted index
 
         # Optional: Basic validation for token address format
         # try:
@@ -653,65 +646,90 @@ async def set_params(update, context):
         # except Exception:
         #     await update.effective_message.reply_text("⚠️ Endereço do token inválido.", parse_mode='Markdown'); return
 
-
+        # Store parameters, excluding amount
         parameters.update(
             target_token_address=target_token_address,
-            amount=amount,
             stop_loss_percent=stop_loss,
             take_profit_percent=take_profit,
             priority_fee=priority_fee
         )
+
+        # Fetch pair details for the target token immediately
+        pair_details = await get_pair_details_by_token_address(target_token_address)
+        if not pair_details:
+            logger.error(f"Não foi possível obter detalhes para o token alvo: {target_token_address}. Verifique o endereço.")
+            await send_telegram_message(f"❌ Não foi possível obter detalhes para o token alvo: `{target_token_address}`. Verifique o endereço.")
+            # Do not set target_pair_details if fetch failed
+            automation_state["current_target_pair_details"] = None
+            automation_state["current_target_pair_address"] = None
+            automation_state["current_target_symbol"] = None
+            return
+
+        # Update automation_state with the target details
+        automation_state["current_target_pair_details"] = pair_details
+        automation_state["current_target_pair_address"] = pair_details.get('pairAddress')
+        automation_state["current_target_symbol"] = pair_details.get('baseToken', {}).get('symbol', 'N/A')
+        automation_state["target_selected_timestamp"] = time.time() # Set timestamp when target is confirmed
+
         await update.effective_message.reply_text(
             f"✅ Parâmetros definidos para o modo manual:\n"
             f"Token Alvo: `{target_token_address}`\n"
-            f"Valor de Compra: {amount} SOL\n"
+            # Removed Valor de Compra Inicial display
             f"Stop Loss: {stop_loss}%\n"
             f"Take Profit: {take_profit}%\n"
-            f"Priority Fee: {priority_fee}",
+            f"Priority Fee: {priority_fee}\n\n"
+            "Use `/buy <VALOR_SOL>` para realizar a primeira compra e `/run` para iniciar o monitoramento de TP/SL.",
             parse_mode='Markdown'
         )
+
     except ValueError:
-        await update.effective_message.reply_text("⚠️ Valores numéricos inválidos. Verifique VALOR_SOL, STOP_LOSS_%, TAKE_PROFIT_% e PRIORITY_FEE.", parse_mode='Markdown')
+        await update.effective_message.reply_text("⚠️ Valores numéricos inválidos. Verifique STOP_LOSS_%, TAKE_PROFIT_% e PRIORITY_FEE.", parse_mode='Markdown')
     except Exception as e:
         logger.error(f"Erro no comando /set: {e}")
-        await update.effective_message.reply_text(f"⚠️ Erro ao definir parâmetros: {e}\nUso: `/set <ENDERECO_TOKEN> <VALOR_SOL> <STOP_LOSS_%> <TAKE_PROFIT_%> [PRIORITY_FEE]`", parse_mode='Markdown')
+        await update.effective_message.reply_text(f"⚠️ Erro ao definir parâmetros: {e}\nUso: `/set <ENDERECO_TOKEN> <STOP_LOSS_%> <TAKE_PROFIT_%> [PRIORITY_FEE]`", parse_mode='Markdown')
 
 
 async def run_bot(update, context):
     """Inicia o loop de trade autônomo (modo manual)."""
     global automation_state, in_position, entry_price
     if automation_state.get("is_running", False):
-        await update.effective_message.reply_text("✅ O bot já está em execução.")
-        return
+        await update.effective_message.reply_text("✅ O bot já está em execução."); return
 
-    # Ensure target token address is set before running
-    if not parameters.get("target_token_address"):
-         await update.effective_message.reply_text("⚠️ Endereço do token alvo não definido. Use `/set <ENDERECO_TOKEN> <VALOR_SOL> <STOP_LOSS_%> <TAKE_PROFIT_%> [PRIORITY_FEE]` antes de iniciar.", parse_mode='Markdown')
+    # Ensure target token and parameters are set before running
+    if not parameters.get("target_token_address") or parameters.get("stop_loss_percent") is None or parameters.get("take_profit_percent") is None:
+         await update.effective_message.reply_text("⚠️ Parâmetros não definidos. Use `/set <ENDERECO_TOKEN> <STOP_LOSS_%> <TAKE_PROFIT_%> [PRIORITY_FEE]` antes de iniciar o monitoramento.", parse_mode='Markdown')
          return
 
-    # Ensure a clean state before starting
-    in_position = False
-    entry_price = 0.0
-    automation_state.update(
-        current_target_pair_address=None, # Will be set in autonomous_loop
-        current_target_symbol=None, # Will be set in autonomous_loop
-        current_target_pair_details=None, # Will be set in autonomous_loop
-        position_opened_timestamp=0,
-        target_selected_timestamp=0, # Will be set in autonomous_loop
-        checking_volatility=False,
-        volatility_check_start_time=0,
-        # Removed penalty_box, discovered_pairs, took_profit_pairs
-    )
+    # Ensure pair details are loaded if /set was used but /run wasn't called immediately
+    if not automation_state.get("current_target_pair_details"):
+         target_token_address = parameters.get("target_token_address")
+         pair_details = await get_pair_details_by_token_address(target_token_address)
+         if not pair_details:
+             logger.error(f"Não foi possível obter detalhes para o token alvo: {target_token_address}. Não é possível iniciar o monitoramento.")
+             await send_telegram_message(f"❌ Loop autônomo não iniciado: Não foi possível obter detalhes para o token alvo: `{target_token_address}`. Verifique o endereço.")
+             automation_state["is_running"] = False
+             return
+
+         automation_state["current_target_pair_details"] = pair_details
+         automation_state["current_target_pair_address"] = pair_details.get('pairAddress')
+         automation_state["current_target_symbol"] = pair_details.get('baseToken', {}).get('symbol', 'N/A')
+         automation_state["target_selected_timestamp"] = time.time() # Set timestamp when target is confirmed
+
+
+    # Check if in_position is True. If not, inform the user to use /buy first.
+    if not in_position:
+        await update.effective_message.reply_text("⚠️ Nenhuma posição aberta. Use `/buy <VALOR_SOL>` para comprar antes de iniciar o monitoramento de TP/SL.", parse_mode='Markdown')
+        return
 
 
     automation_state["is_running"] = True
-    automation_state["task"] = asyncio.create_task(autonomous_loop()) # <-- ESTA LINHA FOI RE-ADICIONADA
+    automation_state["task"] = asyncio.create_task(autonomous_loop())
 
     logger.info("Bot de trade autônomo iniciado.")
     await send_telegram_message(
         "🚀 Bot de trade autônomo iniciado em modo manual!\n"
-        f"Monitorando o token alvo: `{parameters['target_token_address']}`\n"
-        "Use os comandos `/buy <VALOR_SOL>` para comprar ou `/sell` para vender. O bot irá gerenciar Take Profit e Stop Loss automaticamente."
+        f"Monitorando a posição aberta no token alvo: `{automation_state.get('current_target_token_address', 'N/A')}`\n"
+        "O bot irá gerenciar Take Profit e Stop Loss automaticamente. Use os comandos `/buy <VALOR_SOL>` para compras adicionais ou `/sell` para vender manualmente."
     )
 
 async def stop_bot(update, context):
@@ -748,21 +766,22 @@ async def stop_bot(update, context):
         volatility_check_start_time=0,
         # Removed penalty_box, discovered_pairs, took_profit_pairs
     )
+    # Also reset parameters related to the target token
+    parameters.update(
+        target_token_address=None
+    )
 
 
     logger.info("Bot de trade parado.")
     await update.effective_message.reply_text("🛑 Bot parado. Todas as tarefas e posições foram finalizadas.")
 
 async def manual_buy(update, context):
-    global in_position, entry_price
+    global in_position, entry_price, automation_state
     if not automation_state.get("is_running", False):
-        await update.effective_message.reply_text("⚠️ O bot precisa estar em execução. Use /run primeiro.")
-        return
-    if in_position:
-        await update.effective_message.reply_text("⚠️ Já existe uma posição aberta.")
+        await update.effective_message.reply_text("⚠️ O bot precisa estar em execução para executar ordens. Use /run primeiro para iniciar o monitoramento (após definir o token com /set).")
         return
     if not automation_state.get("current_target_pair_details"):
-        await update.effective_message.reply_text("⚠️ O bot ainda não carregou os detalhes do token alvo. Certifique-se de ter usado /set e /run.")
+        await update.effective_message.reply_text("⚠️ O bot ainda não carregou os detalhes do token alvo. Certifique-se de ter usado /set para definir o token alvo primeiro.")
         return
     try:
         amount = float(context.args[0])
@@ -775,18 +794,23 @@ async def manual_buy(update, context):
         if price_usd is not None:
             await update.effective_message.reply_text(f"Forçando compra manual de {amount} SOL em {pair_details['baseToken']['symbol']}...")
             # Pass the price in USD to execute_buy_order
+            # Set manual=True so it skips any non-manual triggers if they were re-added
             await execute_buy_order(amount, price_usd, pair_details, manual=True, reason="Compra Manual Forçada")
-            # entry_price is set inside execute_buy_order if successful
+            # entry_price is set inside execute_buy_order *only if it's the first position*
+            # If already in position, entry_price is NOT updated here.
         else:
             await update.effective_message.reply_text("⚠️ Não foi possível obter o preço atual para a compra.")
     except (IndexError, ValueError):
-        await update.effective_message.reply_text("⚠️ Formato incorreto. Use: `/buy <VALOR>`", parse_mode='Markdown')
+        await update.effective_message.reply_text("⚠️ Formato incorreto. Use: `/buy <VALOR_SOL>`", parse_mode='Markdown')
     except Exception as e:
         logger.error(f"Erro no comando /buy: {e}")
         await update.effective_message.reply_text(f"⚠️ Erro ao executar compra manual: {e}")
 
 async def manual_sell(update, context):
     global in_position, entry_price
+    if not automation_state.get("is_running", False):
+        await update.effective_message.reply_text("⚠️ O bot precisa estar em execução para executar ordens. Use /run primeiro para iniciar o monitoramento.")
+        return
     if not in_position:
         await update.effective_message.reply_text("⚠️ Nenhuma posição aberta para vender.")
         return
